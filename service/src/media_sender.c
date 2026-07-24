@@ -1709,7 +1709,8 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
      * subscriber the live writes are skipped (the retained group below serves
      * any future joiner) -- same discipline as the media drain. A WOULD_BLOCK
      * retries from the cursor (no duplicate / skipped object). */
-    if (moq_pub_has_subscriber(s->pub, s->catalog_track->pub_track)) {
+    bool has_sub = sender_track_demand(s, s->catalog_track);
+    if (has_sub) {
         while (s->pending_obj_cursor < s->pending_obj_count) {
             size_t k = s->pending_obj_cursor;
             moq_pub_object_cfg_t ocfg;
