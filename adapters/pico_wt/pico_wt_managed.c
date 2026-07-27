@@ -12,7 +12,6 @@
 #include <moq/picoquic_verify.h>
 
 #include "../common/moq_alpn.h"
-#include "../common/moq_pq_stream_backlog.h"
 #include "pico_wt_adapter.h"
 
 #include <picoquic.h>
@@ -654,7 +653,8 @@ static int loop_callback(picoquic_quic_t *quic,
         bool drained =
             m->active_cnx &&
             picoquic_get_cnx_state(m->active_cnx) == picoquic_state_ready &&
-            moq_pq_cnx_stream_backlog_empty(m->active_cnx);
+            m->conn &&
+            moq_pq_send_queue_is_empty(m->conn->endpoint_ctx.queue);
         pthread_mutex_lock(&m->mutex);
         m->tx_drained = drained;
         pthread_mutex_unlock(&m->mutex);

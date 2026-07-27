@@ -156,22 +156,12 @@ if(MOQ_BUILD_PQ_THREADED)
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-    # The threaded drain (moq_endpoint_drain) computes its "stream backlog
-    # empty" predicate locally in moq_pq_stream_backlog.h, which intentionally
-    # reads picoquic's private stream state from picoquic_internal.h. picoquic
-    # does not install that header, so this adapter requires source-tree
-    # picoquic (-DMOQ_PICOQUIC_SOURCE_DIR=...); the installed CONFIG-package
-    # mode cannot satisfy it.
-    if(NOT MOQ_PICOQUIC_SOURCE_DIR)
-        message(FATAL_ERROR
-            "MOQ_BUILD_PQ_THREADED requires source-tree picoquic: the threaded "
-            "drain predicate reads picoquic private stream state "
-            "(picoquic_internal.h), which the installed picoquic package does "
-            "not provide. Reconfigure with -DMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic.")
-    endif()
-    target_include_directories(moq-adapter-picoquic-threaded PRIVATE
-        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
-
+    # The threaded drain (moq_endpoint_drain) reports the flush from the
+    # ADAPTER-OWNED send queue (moq_pq_send_queue_is_empty): under the pull
+    # model every reliable byte and FIN passes through that queue on its way to
+    # picoquic, and the queue's byte cap propagates transport backpressure back
+    # into it. No picoquic private header is involved, so this adapter builds
+    # against an installed picoquic CONFIG package as well as a source tree.
     find_package(Threads REQUIRED)
     target_link_libraries(moq-adapter-picoquic-threaded
         PUBLIC moq::adapter-picoquic Threads::Threads)

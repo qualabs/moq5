@@ -285,19 +285,27 @@ MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
  * latched endpoint still yields MOQ_ERR_INTERRUPTED from blocking calls. */
 MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
 
-/* Block (app thread only) until local reliable stream data has been flushed out
- * of the transport's send queues -- no stream still has queued or ready-to-send
- * bytes or an unsent FIN. Call this after writing the last objects and before
- * moq_endpoint_stop() so the abrupt stop does not truncate bytes still sitting
- * in libmoq/picoquic's stream send queues.
+/* Block (app thread only) until local reliable stream data has drained out of
+ * libmoq's own send queues into the transport -- no stream still has queued
+ * bytes or an unsent FIN waiting in libmoq. Call this after writing the last
+ * objects and before moq_endpoint_stop() so the abrupt stop does not truncate
+ * bytes still sitting in libmoq's stream send queues.
  *
  * Scope of the guarantee:
  *   - It DOES mean every reliable stream byte and FIN has been handed to the
- *     transport for sending (local stream backlog empty).
+ *     transport for sending (libmoq's local stream backlog empty). Because the
+ *     send queue is bounded and applies backpressure to the writer, a full
+ *     transport keeps that backlog non-empty -- so this is a meaningful
+ *     "everything was accepted downstream" signal, not merely "we let go".
+ *   - It does NOT mean the transport has put those bytes on the wire: a byte
+ *     accepted by QUIC may still await flow control, congestion or pacing.
  *   - It does NOT mean all packets were acknowledged by the peer (the QUIC
  *     packet/retransmission backlog can remain non-empty on an idle connection
  *     long after the bytes and FIN were sent).
  *   - It does NOT mean the peer application has consumed the media.
+ *
+ * A backend whose transport can additionally prove the wire-level flush may
+ * report a stricter drain; none currently does.
  *
  * Returns:
  *   MOQ_OK              local stream flush complete: stopping will not truncate

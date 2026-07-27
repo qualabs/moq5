@@ -44,6 +44,12 @@ void pq_endpoint_get_stats(const pq_endpoint_ctx_t *ep_ctx,
 void moq_pq_conn_get_send_stats(const moq_pq_conn_t *conn,
                                 moq_pq_send_stats_t *out);
 
+/* True when the connection's outbound queue holds no undelivered reliable data
+ * and no unsent FIN -- everything written has been handed to picoquic. Backs
+ * the graceful-drain probe (implemented in moq_picoquic.c; declared here so the
+ * threaded adapter can aggregate across connections). */
+bool moq_pq_conn_send_queue_empty(const moq_pq_conn_t *conn);
+
 /* Returns 0 on success, -1 on allocation failure (queue create). */
 int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                      pq_endpoint_ctx_t *ep_ctx,

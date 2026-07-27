@@ -83,6 +83,16 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid);
 /* Aggregate bytes currently buffered across all streams (test/telemetry). */
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q);
 
+/* True when NO stream still holds undelivered reliable data or an unsent FIN --
+ * i.e. everything written has been handed to the transport. Backs the adapters'
+ * graceful-drain probe.
+ *
+ * NOT the same as queued_bytes() == 0: a bare FIN is carried by a zero-length
+ * chunk that contributes no bytes, so a stream can have an empty byte count
+ * while its FIN is still pending. This walks the chunk lists so that case is
+ * reported as "not drained". */
+bool moq_pq_send_queue_is_empty(const moq_pq_send_queue_t *q);
+
 /* Telemetry: peak aggregate backlog, and pushes refused for hitting the cap. */
 uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q);
 uint64_t moq_pq_send_queue_would_block_count(const moq_pq_send_queue_t *q);

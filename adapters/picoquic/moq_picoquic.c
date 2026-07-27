@@ -622,6 +622,11 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *c,
     pq_endpoint_get_stats(&c->endpoint_ctx, out);
 }
 
+bool moq_pq_conn_send_queue_empty(const moq_pq_conn_t *c)
+{
+    return !c || moq_pq_send_queue_is_empty(c->endpoint_ctx.queue);
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 int moq_pq_callback(picoquic_cnx_t *cnx,

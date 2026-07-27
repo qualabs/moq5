@@ -315,6 +315,20 @@ uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q)
     return q ? q->queued : 0;
 }
 
+bool moq_pq_send_queue_is_empty(const moq_pq_send_queue_t *q)
+{
+    if (!q) return true;
+    /* Fast path: any unprovided data byte means not drained. */
+    if (q->queued > 0) return false;
+    /* Zero bytes queued still leaves the bare-FIN case: a zero-length chunk
+     * carries a pending FIN without contributing to `queued`. */
+    for (size_t i = 0; i < q->nstreams; i++) {
+        const pq_stream_t *s = &q->streams[i];
+        if (s->in_use && s->head != NULL) return false;
+    }
+    return true;
+}
+
 uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q)
 {
     return q ? q->high_water : 0;

@@ -19,7 +19,6 @@
 #include <picoquic_packet_loop.h>
 
 #include "../common/moq_alpn.h"
-#include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
 
 #include <errno.h>
@@ -861,7 +860,7 @@ static int loop_callback(picoquic_quic_t *quic,
                                             dl == UINT64_MAX ? 0 : dl);
             }
             if (!(picoquic_get_cnx_state(c->cnx) == picoquic_state_ready &&
-                  moq_pq_cnx_stream_backlog_empty(c->cnx)))
+                  moq_pq_conn_send_queue_empty(c->conn)))
                 all_drained = false;
         }
         pthread_mutex_lock(&t->mutex);
@@ -974,7 +973,7 @@ static int loop_callback(picoquic_quic_t *quic,
         bool drained =
             t->active_cnx &&
             picoquic_get_cnx_state(t->active_cnx) == picoquic_state_ready &&
-            moq_pq_cnx_stream_backlog_empty(t->active_cnx);
+            moq_pq_conn_send_queue_empty(t->conn);
         pthread_mutex_lock(&t->mutex);
         t->tx_drained = drained;
         pthread_mutex_unlock(&t->mutex);

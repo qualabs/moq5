@@ -22,18 +22,14 @@
 # one flag covers both.
 set(_MOQ_PQ_NEED_HTTP ${MOQ_BUILD_ADAPTER_PICO_WT})
 
-# A drain-capable adapter (raw threaded helper or managed WebTransport) compiles
-# adapters/common/moq_pq_stream_backlog.h against picoquic's PRIVATE
-# picoquic_internal.h from MOQ_PICOQUIC_SOURCE_DIR. The picoquic LIBRARY it links
-# MUST be that same source revision: linking an installed picoquic of a different
-# revision is a silent ABI mismatch (it reads picoquic_stream_head_t's layout).
-# So in that mode the source tree is authoritative -- the installed CONFIG
-# package is bypassed entirely (see "Installed config package" below), which
-# prevents the "headers from source, library from install" split build.
+# No libmoq adapter reads picoquic's PRIVATE headers any more: the drain-capable
+# adapters (raw threaded helper and managed WebTransport) derive their
+# "stream backlog empty" predicate from the ADAPTER-OWNED send queue
+# (moq_pq_send_queue_is_empty) rather than from picoquic_internal.h's
+# picoquic_stream_head_t. There is therefore no struct-layout coupling that
+# would force the linked library to match a source revision, and an installed
+# picoquic CONFIG package is a valid resolution in every mode.
 set(_MOQ_PQ_REQUIRE_SOURCE OFF)
-if((MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED) AND MOQ_PICOQUIC_SOURCE_DIR)
-    set(_MOQ_PQ_REQUIRE_SOURCE ON)
-endif()
 
 # Normalize a non-namespaced picohttp-core to picoquic::picohttp-core. ALIAS
 # targets are global, so either spelling resolves to the namespaced name the
