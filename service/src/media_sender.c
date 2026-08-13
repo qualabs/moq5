@@ -26,22 +26,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
-#include <stdio.h>      /* TEMP PROBE (live-edge diagnosis): stderr probes below */
 #include <string.h>
 #include <time.h>
-
-/* ==== TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS ==================
- * moq5 ships no logging facility on purpose, so these are raw stderr writes
- * (unbuffered) rather than a real log API. Two probes:
- *   1) a one-shot banner at sender creation -> proves WHICH libmoq is linked
- *   2) a bounded re-anchor probe in preq_drop_all_for_track -> proves the
- *      no-demand drop path actually executes, and reports the queue depth
- * Grep them with the MOQ5_PROBE_TAG below. Bounded so a peer that never
- * subscribes cannot flood the log at frame rate. */
-#define MOQ5_PROBE_TAG   "[moq5-probe]"
-#define MOQ5_PROBE_BUILD "reanchor-fix"
-#define MOQ5_PROBE_MAX   20
-/* ======================================================================= */
 
 #define SENDER_DEFAULT_PRE_READY_OBJECTS 256u
 #define SENDER_DEFAULT_PRE_READY_BYTES   (32u * 1024u * 1024u)
@@ -215,11 +201,6 @@ struct moq_media_track {
                                                 point (the anchor may already
                                                 be emitted, not just queued) */
 
-    /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. Per-track probe state
-     * (mu held on every access) so the re-anchor log is bounded PER TRACK and
-     * the resume that follows is reported exactly once. */
-    uint32_t              probe_drops;       /* re-anchor drops seen so far */
-    bool                  probe_reanchored;  /* awaiting the resume object */
 
     /* Wire-emission state (network thread, but read by the app thread under
      * mu to decide whether a drop must abandon the open subgroup). */
@@ -340,14 +321,6 @@ struct moq_media_sender {
                                              oldest queued object; UINT64_MAX
                                              disables (see the cfg field) */
     uint32_t         ring_cap;            /* physical ring = max(both)+1 */
-
-    /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. Queue-latency probe
-     * accumulators (mu held). Reported once per second from sender_drain. */
-    uint64_t         probe_last_report_us;
-    uint64_t         probe_max_age_us;    /* max head age since last report */
-    uint32_t         probe_max_depth;     /* max queue depth since last report */
-    uint64_t         probe_trim_groups;   /* groups the age bound has dropped */
-    uint64_t         probe_trim_events;
 
     /* App-visible state (mu-protected). */
     pthread_mutex_t  mu;
@@ -712,7 +685,6 @@ static void preq_drop_all_for_track(moq_media_sender_t *s,
 {
     uint32_t rd = s->preq_head, wr = s->preq_head;
     bool dropped_any = false;
-    uint32_t dropped_n = 0;            /* TEMP PROBE: objects this pass */
     while (rd != s->preq_tail) {
         sender_preq_entry_t *e = &s->preq[rd % s->ring_cap];
         if (e->track == t && !e->is_end) {
@@ -721,7 +693,6 @@ static void preq_drop_all_for_track(moq_media_sender_t *s,
             if (e->is_sync) s->stats.keyframes_dropped++;
             preq_entry_release(s, e);   /* clears the slot */
             dropped_any = true;
-            dropped_n++;               /* TEMP PROBE */
         } else {
             if (wr != rd) s->preq[wr % s->ring_cap] = *e;
             wr++;
@@ -738,32 +709,8 @@ static void preq_drop_all_for_track(moq_media_sender_t *s,
         /* Re-anchor (see above): the dropped group is over. The next sync point
          * opens g+1 (group_started stays set, so the id advances rather than
          * reusing the reset one); a delta is refused until then. */
-        /* Re-anchor (see above): the dropped group is over. The next sync point
-         * opens g+1 (group_started stays set, so the id advances rather than
-         * reusing the reset one); a delta is refused until then. */
         t->group_open = false;
         t->cur_group_anchored = false;
-        /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. mu is held. Bounded
-         * PER TRACK (audio opens a group per packet, so a shared counter was
-         * exhausted by audio in under a second and hid the video track). The
-         * running total is reported on the resume line in sender_drain. */
-        t->probe_drops++;
-        t->probe_reanchored = true;
-        if (t->probe_drops <= MOQ5_PROBE_MAX)
-            fprintf(stderr,
-                MOQ5_PROBE_TAG " reanchor(" MOQ5_PROBE_BUILD ") track='%.*s': "
-                "no demand -> dropped %u obj of group %llu, group closed "
-                "(next sync opens %llu); queue now %u obj / %llu B; "
-                "reset_armed=%d [drop #%u]%s\n",
-                (int)t->name.len, (const char *)t->name.data,
-                dropped_n,
-                (unsigned long long)t->group_seq,
-                (unsigned long long)(t->group_seq + 1),
-                (unsigned)(s->preq_tail - s->preq_head),
-                (unsigned long long)s->preq_bytes,
-                (int)t->pending_reset, t->probe_drops,
-                t->probe_drops == MOQ5_PROBE_MAX
-                    ? "  <-- silencing this track; resume will still log" : "");
         pthread_cond_broadcast(&s->space_cv);   /* freed space: wake writers */
     }
 }
@@ -1494,41 +1441,6 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
 {
     uint64_t mono_us = sender_mono_us();   /* age basis; one read per pump */
 
-    /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. Once-per-pump sample of
-     * the standing queue, reported once per second: the direct measurement of
-     * how much latency the SEND QUEUE itself contributes. A steady depth=0
-     * age=0 while streaming means the sender is not the source and the delay
-     * lives downstream (relay or player). */
-    {
-        uint32_t depth = s->preq_tail - s->preq_head;
-        uint64_t head_age = 0;
-        if (depth) {
-            const sender_preq_entry_t *h = &s->preq[s->preq_head % s->ring_cap];
-            if (mono_us > h->enq_us) head_age = mono_us - h->enq_us;
-        }
-        if (head_age > s->probe_max_age_us) s->probe_max_age_us = head_age;
-        if (depth > s->probe_max_depth) s->probe_max_depth = depth;
-        if (!s->probe_last_report_us) s->probe_last_report_us = mono_us;
-        if (mono_us - s->probe_last_report_us >= 1000000ull) {
-            fprintf(stderr,
-                MOQ5_PROBE_TAG " queue: depth=%u (peak %u) head_age=%llu ms "
-                "(peak %llu ms) bytes=%llu bound=%s trims=%llu/%llu groups "
-                "sent=%llu dropped=%llu\n",
-                depth, s->probe_max_depth,
-                (unsigned long long)(head_age / 1000ull),
-                (unsigned long long)(s->probe_max_age_us / 1000ull),
-                (unsigned long long)s->preq_bytes,
-                s->queue_max_age_us == UINT64_MAX ? "off" : "on",
-                (unsigned long long)s->probe_trim_events,
-                (unsigned long long)s->probe_trim_groups,
-                (unsigned long long)s->stats.objects_sent,
-                (unsigned long long)s->stats.objects_dropped);
-            s->probe_last_report_us = mono_us;
-            s->probe_max_age_us = 0;
-            s->probe_max_depth = 0;
-        }
-    }
-
     while (s->preq_head != s->preq_tail) {
         sender_preq_entry_t *e = &s->preq[s->preq_head % s->ring_cap];
         moq_media_track_t *t = e->track;
@@ -1593,20 +1505,8 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
          * trim itself may abandon the open group and arm it. Restart the loop:
          * the trim compacted the ring, so `e` and the head are stale. */
         if (s->queue_max_age_us != UINT64_MAX) {
-            uint32_t trimmed = preq_trim_stale_for_track(s, t, mono_us);
-            if (trimmed) {
-                /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. */
-                s->probe_trim_events++;
-                s->probe_trim_groups += trimmed;
-                fprintf(stderr,
-                    MOQ5_PROBE_TAG " TRIM track='%.*s': queue older than "
-                    "%llu ms -> dropped %u group(s); depth now %u / %llu B\n",
-                    (int)t->name.len, (const char *)t->name.data,
-                    (unsigned long long)(s->queue_max_age_us / 1000ull),
-                    trimmed, (unsigned)(s->preq_tail - s->preq_head),
-                    (unsigned long long)s->preq_bytes);
+            if (preq_trim_stale_for_track(s, t, mono_us))
                 continue;
-            }
         }
 
         /* A drop abandoned this track's open group: reset it on the wire
@@ -1649,25 +1549,6 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         if (wrc < 0) {
             sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             break;
-        }
-
-        /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. The money line: the
-         * FIRST object emitted after a no-demand drop. is_sync=1 with oid=0 is
-         * the fix working (decodable group lead on a fresh group id); is_sync=0
-         * with oid=0 would be the bug (undecodable re-opened group). Also
-         * reports how many objects the gap cost and the queue depth behind it. */
-        if (t->probe_reanchored) {
-            t->probe_reanchored = false;
-            fprintf(stderr,
-                MOQ5_PROBE_TAG " RESUME(" MOQ5_PROBE_BUILD ") track='%.*s': "
-                "group=%llu oid=%llu is_sync=%d starts_group=%d "
-                "(new_group=%d) after %u dropped obj; queue behind %u obj\n",
-                (int)t->name.len, (const char *)t->name.data,
-                (unsigned long long)e->group_seq, (unsigned long long)oid,
-                (int)e->is_sync, (int)e->starts_group, (int)new_group,
-                t->probe_drops,
-                (unsigned)(s->preq_tail - s->preq_head - 1));
-            t->probe_drops = 0;
         }
 
         t->emit_group = e->group_seq;
@@ -3446,22 +3327,6 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
         ? cfg->pre_ready_max_objects : SENDER_DEFAULT_PRE_READY_OBJECTS;
     s->preq_byte_cap = cfg->pre_ready_max_bytes
         ? cfg->pre_ready_max_bytes : SENDER_DEFAULT_PRE_READY_BYTES;
-    /* TEMP PROBE -- REMOVE AFTER THE LATENCY DIAGNOSIS. One line per sender:
-     * proves WHICH libmoq is linked, and dumps the queue bounds (no time bound
-     * exists yet -- that is the pending fix #2). */
-    fprintf(stderr,
-        MOQ5_PROBE_TAG " media_sender build=" MOQ5_PROBE_BUILD
-        " bp=%d drop_without_demand=%d publish_tracks=%d "
-        "queue=%u obj/%llu B preready=%u obj/%llu B max_age=%s\n",
-        (int)s->backpressure, (int)s->drop_without_demand,
-        (int)s->publish_tracks,
-        s->queue_cap, (unsigned long long)s->queue_byte_cap,
-        s->preq_cap, (unsigned long long)s->preq_byte_cap,
-        s->queue_max_age_us == UINT64_MAX ? "off" : "on");
-    if (s->queue_max_age_us != UINT64_MAX)
-        fprintf(stderr, MOQ5_PROBE_TAG " queue_max_age_us=%llu (%llu ms)\n",
-                (unsigned long long)s->queue_max_age_us,
-                (unsigned long long)(s->queue_max_age_us / 1000ull));
     /* One ring serves both phases; size it for the larger bound (+1 so a
      * full ring is distinguishable from empty). */
     s->ring_cap = (s->queue_cap > s->preq_cap ? s->queue_cap : s->preq_cap)
