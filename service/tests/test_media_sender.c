@@ -2508,10 +2508,13 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(wait_ready(s, 300));
         MOQ_TEST_CHECK(atomic_load(&g_srv.ns_accepted));
 
-        /* A full GOP written with no demand: dropped, not held. */
-        for (int i = 0; i < 3; i++) {
-            moq_rcbuf_t *b = mkbuf(16, (uint8_t)i);
-            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+        /* A group-opening keyframe written with no demand: dropped, not held.
+         * Written alone (not as a back-to-back GOP) so the drop is OBSERVED
+         * before the delta below -- the re-anchor assertion needs the drop to
+         * have happened, and the pump is woken per write. */
+        {
+            moq_rcbuf_t *b = mkbuf(16, 0);
+            moq_media_send_object_t o = mkobj(b, true, true, false);
             moq_result_t rc = moq_media_sender_write(s, v, &o);
             if (rc != MOQ_OK) moq_rcbuf_decref(b);
             MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
@@ -2519,12 +2522,28 @@ int main(int argc, char **argv)
         moq_media_sender_stats_t st;
         for (int i = 0; i < 200; i++) {
             (void)moq_media_sender_get_stats(s, &st, sizeof(st));
-            if (st.objects_dropped >= 3 && st.objects_queued == 0) break;
+            if (st.objects_dropped >= 1 && st.objects_queued == 0) break;
             usleep(50000);
         }
-        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 1);
         MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
         MOQ_TEST_CHECK_EQ_U64(st.objects_sent, 0);
+
+        /* RE-ANCHOR: the drop closed the group, so a delta can no longer
+         * continue it -- refused with no ownership taken (the caller keeps its
+         * buffer). Were it admitted, the drain would later emit it as object 0
+         * of a re-opened group id the peer cannot decode, while the sender
+         * believed it had resumed at the live edge. */
+        {
+            moq_rcbuf_t *b = mkbuf(16, 1);
+            moq_media_send_object_t o = mkobj(b, false, false, false);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
+            moq_rcbuf_decref(b);           /* refused: ownership stayed here */
+        }
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 1);  /* refused != dropped */
 
         /* Demand appears: only the fresh GOP written afterwards reaches the
          * subscriber; the pre-demand GOP is gone. */
@@ -2542,13 +2561,168 @@ int main(int argc, char **argv)
         }
         for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
         MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);   /* fresh GOP only */
+        /* The resume is decodable and lands in a FRESH group: never the dropped
+         * group 0 re-opened, and its object 0 IS an independent frame. */
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].group, 1);
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].object, 0);
+        MOQ_TEST_CHECK(g_srv.objs[0].keyframe);
+        MOQ_TEST_CHECK_EQ_INT(g_srv.objs[0].first_byte, 0x10);
+        pthread_mutex_unlock(&g_srv.mu);
         (void)moq_media_sender_get_stats(s, &st, sizeof(st));
         MOQ_TEST_CHECK(st.objects_sent >= 3);
-        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);  /* no further drops */
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 1);  /* no further drops */
 
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == queue_max_age_us: the send queue is bounded in TIME ========== *
+     * The spatial bounds cap how MUCH media stands in the queue, never how
+     * LONG, so a queue built under backpressure becomes permanent added
+     * latency. Deterministic construction WITHOUT needing to stall a real
+     * transport: with no demand and drop_without_demand=false the drain HOLDS
+     * (it breaks at the head), so a GOP can be aged on purpose; when demand
+     * arrives the age bound must drop the stale GOP and resume at the fresh
+     * one. Granularity is one GOP: only groups older than the track's newest
+     * anchor go, so the retained suffix still starts at a sync point. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        atomic_store(&g_srv.no_subscribe, true);   /* withhold demand: hold */
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);           /* DROP_TO_KEYFRAME (a drop policy) */
+        cfg.endpoint = &ec;
+        cfg.queue_max_age_us = 100000;   /* 100 ms */
+        /* Held media puts NOTHING on the wire, so the peer's pump would only
+         * re-evaluate its gated "v" SUBSCRIBE on an idle timer (~9 s here).
+         * A short catalog refresh keeps the pump live via the catalog -- the
+         * documented purpose of the gate's "pump stays live via the catalog" --
+         * so demand appears promptly. It never touches the media FIFO. */
+        cfg.catalog_refresh_interval_us = 200000;
+        /* drop_without_demand stays false: the queue must HOLD, not drop. */
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        /* GOP A: held (no demand), then deliberately aged past the bound. */
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0xA0 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        moq_media_sender_stats_t st;
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 3);   /* held, not dropped */
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_sent, 0);
+
+        usleep(300000);                  /* GOP A is now ~300 ms old > 100 ms */
+
+        /* GOP B: the fresh anchor the trim resumes at. */
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0xB0 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+
+        /* Demand appears: the drain trims the stale GOP A and emits GOP B. */
+        atomic_store(&g_srv.no_subscribe, false);
+        for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
+             i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(s, v));
+        for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
+
+        /* EXACTLY GOP B reached the peer -- GOP A never went out. */
+        MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_INT(g_srv.objs[0].first_byte, 0xB0);
+        MOQ_TEST_CHECK(g_srv.objs[0].keyframe);         /* decodable lead */
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].object, 0);
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].group, 1);  /* GOP B's own group */
+        pthread_mutex_unlock(&g_srv.mu);
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);   /* the whole stale GOP */
+        MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 1);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.queue_max_age_trims_stale_gop");
+    }
+
+    /* == queue_max_age_us: one anchored GOP is never trimmed away ====== *
+     * The bound cannot be honored below the keyframe interval: trimming the
+     * only anchored GOP would strand an undecodable lead, so a lone stale GOP
+     * is KEPT (and the caller must shorten the GOP instead). Same aging
+     * construction, but no second anchor is written. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        atomic_store(&g_srv.no_subscribe, true);
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.queue_max_age_us = 50000;    /* 50 ms; the GOP will far exceed it */
+        cfg.catalog_refresh_interval_us = 200000;   /* keep the peer pump live */
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0xC0 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        usleep(300000);                  /* far past the 50 ms bound */
+
+        atomic_store(&g_srv.no_subscribe, false);
+        for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
+             i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(s, v));
+        for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
+
+        /* Kept and delivered whole: no anchor to fall back to. */
+        MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);
+        moq_media_sender_stats_t st;
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_INT(g_srv.objs[0].first_byte, 0xC0);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.queue_max_age_keeps_lone_gop");
     }
 
     /* == terminal: a fatal handshake makes write return CLOSED ========= *
