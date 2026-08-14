@@ -33,7 +33,6 @@ void     moq_media_sender_test_pump(moq_media_sender_t *s,
 void     moq_media_sender_test_free(moq_media_sender_t *s);
 uint64_t moq_media_sender_test_catalog_group(const moq_media_sender_t *s);
 uint64_t moq_media_sender_test_refresh_interval(const moq_media_sender_t *s);
-unsigned moq_media_sender_test_cfg_tail_mask(const moq_media_sender_t *s);
 unsigned moq_media_sender_test_retained_installs(const moq_media_sender_t *s);
 void     moq_media_sender_test_block_republish_before(moq_media_sender_t *s,
                                                       uint64_t object_id);
@@ -143,42 +142,6 @@ static void test_cfg_exact_old_size(void)
     moq_media_sender_test_free(s);
     free(cfg);
     MOQ_TEST_PASS("refresh_cfg_exact_old_size");
-}
-
-/* Same EXACT old-size ABI canary one field later, for the appended
- * queue_max_age_us: allocate EXACTLY the prefix through
- * catalog_refresh_interval_us (so queue_max_age_us is NOT part of the
- * allocation) and drive create against it. Under ASan any read of the field is a
- * heap-buffer-overflow, so a green run proves the whole-field struct_size gate
- * holds for the newest append too -- the case a caller built against the
- * pre-age struct hits. Portable: derives the offset, no literal. */
-static void test_cfg_exact_old_size_pre_age(void)
-{
-    size_t old = offsetof(moq_media_sender_cfg_t, queue_max_age_us);
-    size_t prev_end = offsetof(moq_media_sender_cfg_t,
-                               catalog_refresh_interval_us) +
-                      sizeof(((moq_media_sender_cfg_t *)0)->
-                                 catalog_refresh_interval_us);
-    size_t aligned = (prev_end + _Alignof(uint64_t) - 1) &
-                     ~(size_t)(_Alignof(uint64_t) - 1);
-    MOQ_TEST_CHECK_EQ_U64((uint64_t)old, (uint64_t)aligned);
-
-    moq_media_sender_cfg_t *cfg = (moq_media_sender_cfg_t *)malloc(old);
-    MOQ_TEST_CHECK(cfg != NULL);
-    moq_media_sender_cfg_init_live_sized(cfg, old);   /* writes only [0, old) */
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
-    cfg->namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
-    moq_media_sender_t *s = moq_media_sender_test_new_cfg(cfg);
-    MOQ_TEST_CHECK(s != NULL);
-    /* The refresh field IS covered here (it precedes the new one) and still
-     * resolves its own default; the age bound was never read -> disabled, so
-     * the tail mask must NOT report it as enabled. */
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
-    MOQ_TEST_CHECK((moq_media_sender_test_cfg_tail_mask(s) & 1024u) == 0);
-    moq_media_sender_test_free(s);
-    free(cfg);
-    MOQ_TEST_PASS("refresh_cfg_exact_old_size_pre_age");
 }
 
 /* Poisoned-tail read-gate: a full-size struct whose field bytes are left
@@ -1029,7 +992,6 @@ int main(void)
     test_cfg_default_interval();
     test_cfg_custom_and_disable();
     test_cfg_exact_old_size();
-    test_cfg_exact_old_size_pre_age();
     test_cfg_poisoned_tail();
     test_receiver_refresh_dedup();
     test_receiver_late_bootstrap();

@@ -200,31 +200,6 @@ typedef struct moq_media_sender_cfg {
      * A real track add/remove/conversion generation always takes precedence
      * and resets the refresh cadence; no demand means no refresh. */
     uint64_t                             catalog_refresh_interval_us;
-
-    /* Maximum age of the OLDEST queued object, in microseconds -- a latency
-     * bound on the send queue, complementing the purely spatial
-     * queue_max_objects / queue_max_bytes bounds. Those cap how much media can
-     * stand in the queue but not for how long: at a live bitrate the default
-     * object bound is seconds deep, and under sustained transport backpressure
-     * the queue fills to it and every subsequent object inherits that standing
-     * delay, so the sender runs a fixed distance BEHIND the live edge with no
-     * bound ever exceeded.
-     *
-     * When the oldest queued object of a track is older than this, the drain
-     * drops that track's stale groups to catch up. Only groups strictly older
-     * than the track's newest queued sync point go, so the retained suffix
-     * still begins at a sync point (the same invariant the eviction policies
-     * keep) -- the effective granularity is therefore ONE GOP: a bound tighter
-     * than the keyframe interval cannot be met while a single GOP is queued.
-     *
-     * Applies only under a drop backpressure policy (DROP_TO_KEYFRAME /
-     * DROP_GROUP); a lossless policy never drops on its own, so the field is
-     * ignored there. Post-ready only (the pre-ready phase has no drain).
-     *   0 (or an old-size caller whose struct_size predates this field):
-     *     library default -- DISABLED, only the spatial bounds apply.
-     *   UINT64_MAX: explicitly disabled (same as the default).
-     *   a finite nonzero value: that bound. */
-    uint64_t                             queue_max_age_us;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
