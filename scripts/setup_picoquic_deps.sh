@@ -49,6 +49,12 @@
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
+#
+# Windows (Git Bash + Visual Studio 2022): picotls also needs pkg-config, and
+# neither it nor OpenSSL ships with the toolchain. E.g. with vcpkg:
+#   vcpkg install openssl pkgconf --triplet x64-windows-static-md
+#   export OPENSSL_ROOT_DIR=<vcpkg>/installed/x64-windows-static-md
+#   export PKG_CONFIG=$OPENSSL_ROOT_DIR/tools/pkgconf/pkgconf.exe
 
 set -euo pipefail
 
@@ -78,7 +84,8 @@ build_picotls() {
     fi
     cmake "${cmake_args[@]}" >/dev/null || return $?
     # Only the library targets used by FindPTLS; not dependency CLI/test tools.
-    cmake --build "$build_dir" \
+    # --config selects Release under multi-config generators (Visual Studio).
+    cmake --build "$build_dir" --config Release \
         --target picotls-core picotls-openssl picotls-minicrypto \
         -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
 }
@@ -194,6 +201,19 @@ exec 3>&1 1>&2
 command -v git   >/dev/null 2>&1 || die "git not found"
 command -v cmake >/dev/null 2>&1 || die "cmake not found"
 
+# Without OpenSSL picotls silently drops its OpenSSL backend and the build then
+# fails on the missing picotls-openssl target; on Windows neither OpenSSL nor
+# pkg-config comes with the toolchain, so check up front.
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+    if [ -z "${PKG_CONFIG:-}" ] && ! command -v pkg-config >/dev/null 2>&1; then
+        die "pkg-config not found (picotls requires it); install one (e.g. vcpkg pkgconf) and set PKG_CONFIG=/path/to/pkgconf.exe"
+    fi
+    [ -n "${OPENSSL_ROOT_DIR:-}" ] \
+        || die "OPENSSL_ROOT_DIR not set; point it at an OpenSSL install (e.g. vcpkg x64-windows-static-md)"
+    ;;
+esac
+
 # Fetch a repo at an exact commit into $dir (idempotent, shallow when
 # the server allows fetch-by-SHA, which GitHub does).
 fetch_at() {
@@ -236,6 +256,7 @@ build_picotls "$picotls_dir" "$picotls_build"
 
 # Sanity: picotls-core archive must exist where FindPicoquic expects it.
 ls "$picotls_build"/libpicotls-core.* >/dev/null 2>&1 \
+    || [ -f "$picotls_build/picotls-core.lib" ] \
     || die "picotls build produced no libpicotls-core in $picotls_build"
 
 # -- Emit the two configure inputs -------------------------------------

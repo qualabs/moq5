@@ -49,7 +49,7 @@
 #include "../../adapters/common/moq_alpn.h"
 
 #include <assert.h>
-#include <pthread.h>
+#include "../../adapters/common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include <stdatomic.h>
 #include <time.h>   /* clock_gettime: drain deadline (service tier may use the wall clock) */
 #include <string.h>

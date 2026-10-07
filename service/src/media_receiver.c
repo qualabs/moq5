@@ -22,7 +22,7 @@
 #include "endpoint_internal.h"
 
 #include <errno.h>
-#include <pthread.h>
+#include "../../adapters/common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
