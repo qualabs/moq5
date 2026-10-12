@@ -160,6 +160,12 @@ apply_unreachable_patch() {
         "unreachable send tuple"
 }
 
+apply_probe_wake_patch() {
+    apply_picoquic_patch "$1" \
+        "$repo_root/patches/picoquic/0003-probe-new-path-wake.patch" \
+        "probe new path wake"
+}
+
 patch_selftest() (
     set -eu
     tmp=$(mktemp -d)
@@ -237,6 +243,7 @@ log "deps dir: $MOQ_DEPS_DIR"
 fetch_at "$PICOQUIC_REPO" "$PICOQUIC_REF" "$picoquic_dir"
 apply_capsule_patch "$picoquic_dir"
 apply_unreachable_patch "$picoquic_dir"
+apply_probe_wake_patch "$picoquic_dir"
 fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 
 # picotls carries minicrypto backends as submodules pinned by the parent
