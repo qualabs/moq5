@@ -43,8 +43,9 @@
 #   PICOTLS_REF     picotls commit       (default: pinned below)
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
 #
-# The tracked capsule-parser patch is applied after checkout. Already-patched
-# inputs are accepted; conflicting inputs fail before any dependency build.
+# The tracked picoquic patches (patches/picoquic) are applied after checkout.
+# Already-patched inputs are accepted; conflicting inputs fail before any
+# dependency build.
 # --self-test checks patching and the compiler policy with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
@@ -134,18 +135,29 @@ C
     printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal PASS\n'
 )
 
-apply_capsule_patch() {
-    local dir=$1
-    local patch="$repo_root/patches/picoquic/0001-h3zero-reset-capsule-value-read.patch"
-    [ -f "$patch" ] || die "missing capsule patch: $patch"
+apply_picoquic_patch() {
+    local dir=$1 patch=$2 name=$3
+    [ -f "$patch" ] || die "missing $name patch: $patch"
     if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
-        git -C "$dir" apply "$patch" || die "capsule patch application failed"
-        log "applied capsule reset patch"
+        git -C "$dir" apply "$patch" || die "$name patch application failed"
+        log "applied $name patch"
     elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
-        log "capsule reset patch already applied"
+        log "$name patch already applied"
     else
-        die "capsule reset patch conflicts with $dir"
+        die "$name patch conflicts with $dir"
     fi
+}
+
+apply_capsule_patch() {
+    apply_picoquic_patch "$1" \
+        "$repo_root/patches/picoquic/0001-h3zero-reset-capsule-value-read.patch" \
+        "capsule reset"
+}
+
+apply_unreachable_patch() {
+    apply_picoquic_patch "$1" \
+        "$repo_root/patches/picoquic/0002-sockloop-unreachable-send-tuple.patch" \
+        "unreachable send tuple"
 }
 
 patch_selftest() (
@@ -176,7 +188,7 @@ patch_selftest() (
     if (repo_root="$tmp/missing"; apply_capsule_patch "$tmp/tree") > "$tmp/log" 2>&1; then
         die "self-test: missing patch was accepted"
     fi
-    grep -qF 'missing capsule patch' "$tmp/log"
+    grep -qF 'missing capsule reset patch' "$tmp/log"
     printf 'capsule patch self-test: apply, repeat, conflict, missing PASS\n'
 )
 
@@ -224,6 +236,7 @@ log "deps dir: $MOQ_DEPS_DIR"
 
 fetch_at "$PICOQUIC_REPO" "$PICOQUIC_REF" "$picoquic_dir"
 apply_capsule_patch "$picoquic_dir"
+apply_unreachable_patch "$picoquic_dir"
 fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 
 # picotls carries minicrypto backends as submodules pinned by the parent

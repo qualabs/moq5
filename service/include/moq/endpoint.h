@@ -330,6 +330,20 @@ MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
  * latched endpoint still yields MOQ_ERR_INTERRUPTED from blocking calls. */
 MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
 
+/* Report that the local network changed (e.g. the OS signalled an interface
+ * switch). A client connection then checks whether its local address still
+ * routes to the server and, if not, migrates to the new one with QUIC
+ * connection migration (RFC 9000 §9) without interrupting the MoQ session.
+ * Backends that migrate do so on their own when the local address
+ * disappears; this call also covers changes that leave the old address
+ * configured, which only the OS can see.
+ *
+ * Callable from any thread, coalesced, non-blocking. Returns MOQ_OK when the
+ * check was scheduled, MOQ_ERR_UNSUPPORTED when the backend or perspective
+ * cannot migrate (only a client initiates migration), MOQ_ERR_CLOSED after
+ * stop or terminal, and MOQ_ERR_INVAL for a NULL endpoint. */
+MOQ_API moq_result_t moq_endpoint_network_changed(moq_endpoint_t *ep);
+
 /* Block (app thread only) until local reliable stream data has been flushed out
  * of the transport's send queues -- no stream still has queued or ready-to-send
  * bytes or an unsent FIN. Call this after writing the last objects and before

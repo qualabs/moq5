@@ -292,6 +292,45 @@ picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *cnx)
     return picoquic_state_ready;
 }
 
+/* Client migration: the pair raises no path events, so the adapter only
+ * enables path callbacks; the rest is linked but never reached. */
+void picoquic_enable_path_callbacks(picoquic_cnx_t *cnx, int are_enabled)
+{
+    (void)cnx; (void)are_enabled;
+}
+void picoquic_get_peer_addr(picoquic_cnx_t *cnx, struct sockaddr **addr)
+{
+    (void)cnx;
+    *addr = NULL;
+}
+void picoquic_get_local_addr(picoquic_cnx_t *cnx, struct sockaddr **addr)
+{
+    (void)cnx;
+    *addr = NULL;
+}
+int picoquic_addr_length(const struct sockaddr *addr)
+{
+    (void)addr;
+    return 0;
+}
+int picoquic_compare_addr(const struct sockaddr *expected,
+                          const struct sockaddr *actual)
+{
+    (void)expected; (void)actual;
+    return -1;
+}
+int picoquic_probe_new_path(picoquic_cnx_t *cnx, const struct sockaddr *addr_peer,
+                            const struct sockaddr *addr_local,
+                            uint64_t current_time)
+{
+    (void)cnx; (void)addr_peer; (void)addr_local; (void)current_time;
+    return -1;
+}
+void picoquic_log_app_message(picoquic_cnx_t *cnx, const char *fmt, ...)
+{
+    (void)cnx; (void)fmt;
+}
+
 /* ================================================================== */
 /* Pair lifecycle                                                      */
 /* ================================================================== */

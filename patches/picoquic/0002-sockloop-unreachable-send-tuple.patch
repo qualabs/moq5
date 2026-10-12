@@ -1,0 +1,24 @@
+Pass the send tuple, not the address of the pointers to it, when a socket
+error reports the destination unreachable. picoquic_packet_loop_do_udp_send
+receives peer_addr and local_addr as pointers, so taking their address hands
+picoquic_notify_destination_unreachable stack garbage: no path ever matches
+and the notification is lost. A client whose local address disappeared then
+never sees its path suspended, so it cannot migrate.
+
+Introduced upstream by aee2b75d ("Refactor socket loop before testing QMux");
+still present at 1d416567.
+
+Applies to picoquic 55b473e207e436d06ea9a2895cc1fc555d42c81c.
+
+diff --git a/picoquic/sockloop.c b/picoquic/sockloop.c
+--- a/picoquic/sockloop.c
++++ b/picoquic/sockloop.c
+@@ -2332,7 +2332,7 @@ int picoquic_packet_loop_do_udp_send(
+ 
+             if (picoquic_socket_error_implies_unreachable(sock_err)) {
+                 picoquic_notify_destination_unreachable(last_cnx, current_time,
+-                    (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, if_index,
++                    (struct sockaddr*)peer_addr, (struct sockaddr*)local_addr, if_index,
+                     sock_err);
+             }
+             else if (sock_err == EIO) {

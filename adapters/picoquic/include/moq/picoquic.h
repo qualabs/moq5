@@ -242,6 +242,26 @@ uint64_t moq_pq_conn_close_code(const moq_pq_conn_t *conn);
 int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us);
 
 /*
+ * Client connection migration (RFC 9000 §9).
+ *
+ * On a client connection the adapter moves to a new local address when the
+ * current one stops working. picoquic reports the path suspended once a send
+ * fails as unreachable (e.g. the local address was removed); the following
+ * moq_pq_service() asks the kernel which source address now routes to the
+ * peer and, if it differs, probes it with picoquic_probe_new_path(). picoquic
+ * validates the new path and moves the connection onto it. Nothing is probed
+ * when the server disabled active migration. To receive the path events the
+ * adapter enables picoquic path callbacks on client connections it attaches to.
+ *
+ * moq_pq_conn_network_changed() requests the same check without waiting for a
+ * send to fail, for applications told by the OS that the network changed
+ * (e.g. an interface switch that leaves the old address configured). It is
+ * acted on by the next moq_pq_service(). Network thread only; a no-op on
+ * server connections.
+ */
+void moq_pq_conn_network_changed(moq_pq_conn_t *conn);
+
+/*
  * Picoquic stream data callback. Install this as the connection's
  * callback function. The callback context must be the moq_pq_conn_t*.
  *

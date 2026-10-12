@@ -458,10 +458,12 @@ size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
  * So a failed cert verification is observable via is_fatal(). */
 bool     moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t);
 uint64_t moq_pq_threaded_fatal_code(const moq_pq_threaded_t *t);
-/* The picoquic local error captured when a CLIENT connection failed during the
+/* The picoquic error captured when a CLIENT connection failed: during the
  * handshake (a QUIC CRYPTO_ERROR = 0x100|alert for a TLS failure, else a
- * transport code; 0 when there was no such failure). The service endpoint
- * classifies it into a transport-agnostic terminal reason. Thread-safe. */
+ * transport code; is_fatal() is true), or after setup when the transport was
+ * lost (e.g. idle timeout; the session closed and is_fatal() stays false).
+ * 0 when there was no such failure. The service endpoint classifies it into a
+ * transport-agnostic terminal reason. Thread-safe. */
 uint64_t moq_pq_threaded_terminal_error(const moq_pq_threaded_t *t);
 
 /* Graceful-drain probe (backs moq_endpoint_drain). 1 = local stream flush done
@@ -488,6 +490,20 @@ moq_version_t moq_pq_threaded_negotiated_version(const moq_pq_threaded_t *t);
  * Returns MOQ_ERR_INTERNAL on pipe/event failure.
  */
 moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t);
+
+/*
+ * Tell a client facade that the network changed (e.g. the OS reported an
+ * interface switch), so the connection checks whether its local address is
+ * still the one that routes to the server and migrates if not (RFC 9000 §9;
+ * see moq_pq_conn_network_changed). The facade also migrates on its own when
+ * its local address disappears; this call covers changes that leave the old
+ * address in place.
+ *
+ * Safe from any thread. Coalesced like moq_pq_threaded_wake, whose return
+ * codes it shares. Returns MOQ_ERR_UNSUPPORTED on a server facade: only a
+ * client initiates migration.
+ */
+moq_result_t moq_pq_threaded_network_changed(moq_pq_threaded_t *t);
 
 /*
  * Block until activity or timeout.

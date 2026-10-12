@@ -381,6 +381,9 @@ typedef struct ep_backend_vtable {
     void          (*terminal)(void *facade,
                               moq_endpoint_terminal_reason_t *reason,
                               uint64_t *detail);
+    /* Network-change notification (for moq_endpoint_network_changed). NULL =
+     * the backend cannot migrate (caller maps to MOQ_ERR_UNSUPPORTED). */
+    moq_result_t  (*network_changed)(void *facade);
 } ep_backend_vtable_t;
 
 /* drain_state return codes. */
@@ -771,6 +774,11 @@ static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
         *reason = MOQ_ENDPOINT_TERMINAL_CLEAN; *detail = 0;
         return;
     }
+    if (terminal_error != 0) {
+        /* A transport loss after setup (not fatal: the session closed). */
+        *reason = MOQ_ENDPOINT_TERMINAL_TRANSPORT; *detail = terminal_error;
+        return;
+    }
     *reason = MOQ_ENDPOINT_TERMINAL_NONE; *detail = 0;
 }
 #endif
@@ -795,10 +803,11 @@ static void          pq_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, 
         false /* raw QUIC: no clean-close concept */,
         moq_pq_threaded_terminal_error(t), r, d);
 }
+static moq_result_t  pq_vt_network_changed(void *f) { return moq_pq_threaded_network_changed((moq_pq_threaded_t *)f); }
 static const ep_backend_vtable_t PQ_VT = {
     pq_vt_wait, pq_vt_wake, pq_vt_negver, pq_vt_is_fatal,
     pq_vt_fatal_code, pq_vt_clean_closed, pq_vt_drain_state, pq_vt_stop,
-    pq_vt_destroy, pq_vt_terminal,
+    pq_vt_destroy, pq_vt_terminal, pq_vt_network_changed,
 };
 #endif
 
@@ -1040,6 +1049,14 @@ void moq_endpoint_wake(moq_endpoint_t *ep)
 {
     if (!ep) return;
     ep_facade_wake(ep);
+}
+
+moq_result_t moq_endpoint_network_changed(moq_endpoint_t *ep)
+{
+    if (!ep) return MOQ_ERR_INVAL;
+    if (!ep->vt || !ep->facade) return MOQ_ERR_CLOSED;
+    if (!ep->vt->network_changed) return MOQ_ERR_UNSUPPORTED;
+    return ep->vt->network_changed(ep->facade);
 }
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \

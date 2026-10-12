@@ -141,10 +141,12 @@ struct moq_pq_threaded {
     size_t              max_connections;
     bool                fatal;
     uint64_t            fatal_code;
-    uint64_t            terminal_error;  /* picoquic local error captured at a
-                                          * client handshake/transport failure;
-                                          * 0 otherwise. Classified by the
-                                          * service endpoint (TLS vs transport). */
+    uint64_t            terminal_error;  /* picoquic error captured at a client
+                                          * handshake/transport failure, before
+                                          * setup (with fatal) or after it (a
+                                          * transport loss, without fatal); 0
+                                          * otherwise. Classified by the service
+                                          * endpoint (TLS vs transport). */
     bool                stopped;
     bool                pump_exit;
     bool                loop_running;   /* packet loop is active; stop waits
@@ -162,6 +164,8 @@ struct moq_pq_threaded {
     moq_version_t       negotiated;     /* 0 until the version is known */
     bool                activity_pending;
     bool                wake_pending;
+    bool                network_changed;  /* client: check the local address
+                                           * on the next pump cycle */
     int                 wake_in_flight;
     pthread_t           network_thread_id;
     bool                network_thread_id_set;
@@ -1083,6 +1087,29 @@ static int loop_callback(picoquic_quic_t *quic,
         }
     }
 
+    /* Client mode: after setup, a transport failure (e.g. the idle timeout of
+     * a path that died and could not migrate) reaches the bridge as a clean
+     * close. Keep picoquic's error so the endpoint reports a transport terminal
+     * instead of none. A local application close leaves both errors at 0. */
+    if (t->perspective == MOQ_PERSPECTIVE_CLIENT && t->setup_reached &&
+        t->active_cnx &&
+        picoquic_get_cnx_state(t->active_cnx) == picoquic_state_disconnected) {
+        uint64_t err = picoquic_get_local_error(t->active_cnx);
+        if (err == 0)
+            err = picoquic_get_remote_error(t->active_cnx);
+        pthread_mutex_lock(&t->mutex);
+        if (!t->fatal && t->terminal_error == 0)
+            t->terminal_error = err;
+        pthread_mutex_unlock(&t->mutex);
+    }
+
+    pthread_mutex_lock(&t->mutex);
+    bool network_changed = t->network_changed;
+    t->network_changed = false;
+    pthread_mutex_unlock(&t->mutex);
+    if (network_changed)
+        moq_pq_conn_network_changed(t->conn);
+
     /* service → on_lane_pump → service */
     if (moq_pq_service(t->conn, now) < 0) {
         pthread_mutex_lock(&t->mutex);
@@ -1967,6 +1994,17 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
     }
     pthread_mutex_unlock(&t->mutex);
     return MOQ_OK;
+}
+
+moq_result_t moq_pq_threaded_network_changed(moq_pq_threaded_t *t)
+{
+    if (!t) return MOQ_ERR_INVAL;
+    if (t->perspective != MOQ_PERSPECTIVE_CLIENT) return MOQ_ERR_UNSUPPORTED;
+
+    pthread_mutex_lock(&t->mutex);
+    t->network_changed = true;
+    pthread_mutex_unlock(&t->mutex);
+    return moq_pq_threaded_wake(t);
 }
 
 /* ------------------------------------------------------------------ */

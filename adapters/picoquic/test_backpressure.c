@@ -10,6 +10,7 @@
 #include <moq/rcbuf.h>
 #include "../common/moq_pq_send_queue.h"
 #include "picoquic_endpoint.h"
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -104,11 +105,13 @@ static uint64_t g_rx_window = 65535;        /* uni streams */
 static uint64_t g_rx_window_bidi_remote = 0; /* peer-initiated bidi (0 = uni value) */
 static uint64_t g_rx_window_bidi_local = 0;  /* locally-initiated bidi (0 = uni value) */
 static bool g_tp_null = false;               /* TPs unreadable -> fail closed */
+static bool g_tp_migration_disabled = false; /* peer disable_active_migration */
 picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c,
     int get_local)
     { (void)c; (void)get_local; static picoquic_tp_t tp;
       if (g_tp_null) return NULL;
       memset(&tp, 0, sizeof(tp)); tp.max_datagram_frame_size = 1252;
+      tp.migration_disabled = g_tp_migration_disabled;
       tp.initial_max_stream_data_uni = g_rx_window;
       tp.initial_max_stream_data_bidi_remote =
           g_rx_window_bidi_remote ? g_rx_window_bidi_remote : g_rx_window;
@@ -159,6 +162,59 @@ int picoquic_is_client(picoquic_cnx_t *c) { (void)c; return g_is_client; }
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *c)
     { (void)c; return g_cnx_state; }
+
+/* Client migration: g_peer_addr / g_local_addr model the current path, and
+ * probes are recorded so a test can assert when and where the adapter
+ * migrates. The adapter's route lookup itself is real (a UDP connect). */
+static struct sockaddr_storage g_peer_addr;
+static struct sockaddr_storage g_local_addr;
+static int g_path_cb_enabled = 0;
+static int g_probe_calls = 0;
+static int g_probe_rc = 0;
+static struct sockaddr_storage g_probe_local;
+void picoquic_enable_path_callbacks(picoquic_cnx_t *c, int on)
+    { (void)c; g_path_cb_enabled = on; }
+void picoquic_get_peer_addr(picoquic_cnx_t *c, struct sockaddr **a)
+    { (void)c; *a = (struct sockaddr *)&g_peer_addr; }
+void picoquic_get_local_addr(picoquic_cnx_t *c, struct sockaddr **a)
+    { (void)c; *a = (struct sockaddr *)&g_local_addr; }
+int picoquic_addr_length(const struct sockaddr *a)
+    { return a->sa_family == AF_INET ? (int)sizeof(struct sockaddr_in)
+           : a->sa_family == AF_INET6 ? (int)sizeof(struct sockaddr_in6) : 0; }
+int picoquic_compare_addr(const struct sockaddr *x, const struct sockaddr *y)
+    { if (x->sa_family != y->sa_family) return -1;
+      if (x->sa_family == AF_INET) {
+          const struct sockaddr_in *a = (const struct sockaddr_in *)x;
+          const struct sockaddr_in *b = (const struct sockaddr_in *)y;
+          return (a->sin_addr.s_addr == b->sin_addr.s_addr &&
+                  a->sin_port == b->sin_port) ? 0 : -1; }
+      return -1; }
+int picoquic_probe_new_path(picoquic_cnx_t *c, const struct sockaddr *peer,
+    const struct sockaddr *local, uint64_t now)
+    { (void)c; (void)peer; (void)now; g_probe_calls++;
+      memset(&g_probe_local, 0, sizeof(g_probe_local));
+      memcpy(&g_probe_local, local, (size_t)picoquic_addr_length(local));
+      return g_probe_rc; }
+void picoquic_log_app_message(picoquic_cnx_t *c, const char *fmt, ...)
+    { (void)c; (void)fmt; }
+
+static void set_addr(struct sockaddr_storage *ss, const char *ip, uint16_t port)
+{
+    struct sockaddr_in *a = (struct sockaddr_in *)ss;
+    memset(ss, 0, sizeof(*ss));
+    a->sin_family = AF_INET;
+    a->sin_port = htons(port);
+    inet_pton(AF_INET, ip, &a->sin_addr);
+}
+
+static bool addr_is(const struct sockaddr_storage *ss, const char *ip,
+                    uint16_t port)
+{
+    struct sockaddr_storage want;
+    set_addr(&want, ip, port);
+    return picoquic_compare_addr((const struct sockaddr *)ss,
+                                 (const struct sockaddr *)&want) == 0;
+}
 
 /* -- Helpers -------------------------------------------------------- */
 
@@ -2149,6 +2205,114 @@ int main(void)
         g_hook_count = 0;
         CHECK(moq_pq_service(ad, g_time) == 0);
         CHECK(g_hook_count == 1);
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- Client connection migration (RFC 9000 §9) -------------------- */
+    {
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        set_addr(&g_peer_addr, "127.0.0.1", 4433);
+        set_addr(&g_local_addr, "10.255.0.1", 5555);
+        g_is_client = 1;
+        g_path_cb_enabled = 0;
+        g_probe_calls = 0;
+        g_probe_rc = 0;
+        moq_pq_conn_t *ad = mkad(&al, c);
+        CHECK(g_path_cb_enabled == 1);
+        uint64_t t0 = g_time;
+
+        /* A healthy path is left alone. */
+        CHECK(moq_pq_service(ad, t0) == 0);
+        CHECK(g_probe_calls == 0);
+
+        /* The path is suspended and its local address no longer routes to
+         * the peer: probe the kernel's source address (loopback here) on the
+         * path's local port. */
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_path_suspended,
+                        ad, NULL);
+        CHECK(moq_pq_service(ad, t0 + 1) == 0);
+        CHECK(g_probe_calls == 1);
+        CHECK(addr_is(&g_probe_local, "127.0.0.1", 5555));
+
+        /* While that validation is in flight the address is not re-probed;
+         * once it stays unconfirmed past the probe timeout it is. */
+        CHECK(moq_pq_service(ad, t0 + 250000) == 0);
+        CHECK(moq_pq_service(ad, t0 + 1000000) == 0);
+        CHECK(g_probe_calls == 1);
+        CHECK(moq_pq_service(ad, t0 + 3200000) == 0);
+        CHECK(g_probe_calls == 2);
+
+        /* The path is validated: watching stops. */
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_path_available,
+                        ad, NULL);
+        CHECK(moq_pq_service(ad, t0 + 7000000) == 0);
+        CHECK(g_probe_calls == 2);
+
+        /* A reported network change probes too; a transient probe failure
+         * (no spare peer connection ID) is retried on the next check. */
+        g_probe_calls = 0;
+        g_probe_rc = -1;
+        moq_pq_conn_network_changed(ad);
+        CHECK(moq_pq_service(ad, t0 + 8000000) == 0);
+        CHECK(g_probe_calls == 1);
+        CHECK(moq_pq_service(ad, t0 + 8100000) == 0);
+        CHECK(g_probe_calls == 1);
+        CHECK(moq_pq_service(ad, t0 + 8300000) == 0);
+        CHECK(g_probe_calls == 2);
+        g_probe_rc = 0;
+        CHECK(moq_pq_service(ad, t0 + 8600000) == 0);
+        CHECK(g_probe_calls == 3);
+        CHECK(moq_pq_service(ad, t0 + 9000000) == 0);
+        CHECK(g_probe_calls == 3);
+
+        /* A network change that keeps the current address: nothing to do. */
+        set_addr(&g_local_addr, "127.0.0.1", 5555);
+        g_probe_calls = 0;
+        moq_pq_conn_network_changed(ad);
+        CHECK(moq_pq_service(ad, t0 + 10000000) == 0);
+        CHECK(moq_pq_service(ad, t0 + 10300000) == 0);
+        CHECK(g_probe_calls == 0);
+
+        /* Not before the connection is READY. */
+        set_addr(&g_local_addr, "10.255.0.1", 5555);
+        g_cnx_state = picoquic_state_client_ready_start;
+        moq_pq_conn_network_changed(ad);
+        CHECK(moq_pq_service(ad, t0 + 11000000) == 0);
+        CHECK(g_probe_calls == 0);
+        g_cnx_state = picoquic_state_ready;
+        CHECK(moq_pq_service(ad, t0 + 12000000) == 0);
+        CHECK(g_probe_calls == 1);
+
+        /* The server disabled active migration: never probe. */
+        g_probe_calls = 0;
+        g_tp_migration_disabled = true;
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_path_suspended,
+                        ad, NULL);
+        CHECK(moq_pq_service(ad, t0 + 15000000) == 0);
+        CHECK(moq_pq_service(ad, t0 + 15300000) == 0);
+        CHECK(g_probe_calls == 0);
+        g_tp_migration_disabled = false;
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+    /* Only a client initiates migration. */
+    {
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        set_addr(&g_local_addr, "10.255.0.1", 5555);
+        g_is_client = 0;
+        g_path_cb_enabled = 0;
+        g_probe_calls = 0;
+        moq_pq_conn_t *ad = mkad(&al, c);
+        CHECK(g_path_cb_enabled == 0);
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_path_suspended,
+                        ad, NULL);
+        moq_pq_conn_network_changed(ad);
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(g_probe_calls == 0);
         moq_pq_conn_destroy(ad);
         moq_session_destroy(c); moq_session_destroy(s);
     }
