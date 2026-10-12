@@ -182,6 +182,9 @@ static moq_media_sender_t *lossless_sender(uint64_t block_timeout_us, bool cmaf,
     tc.packaging = cmaf ? MOQ_MEDIA_PACKAGING_CMAF : MOQ_MEDIA_PACKAGING_RAW;
     tc.codec = (moq_bytes_t){ CODEC, 11 };
     tc.bitrate = 1000000;
+    /* CMSF-01 3.1: a CMAF track must carry its init segment. */
+    static const uint8_t init[4] = { 0, 0, 0, 8 };
+    if (cmaf) tc.init_data = (moq_bytes_t){ init, sizeof(init) };
     if (moq_media_sender_add_track(s, &tc, t) != MOQ_OK) { moq_media_sender_test_free(s); return NULL; }
     return s;
 }
