@@ -174,6 +174,18 @@ struct moq_pq_threaded {
     /* Characterization telemetry (env MOQ_PQ_THREADED_STATS=1). Written only on
      * the network thread; read after the thread is joined at stop. */
     bool                stats_enabled;
+
+    /* Diagnostics (env MOQ_PQ_LOOP_TRACE): one line per second from the
+     * network thread saying what the loop saw and what it decided to wait
+     * for, plus a line from the app side when the loop has gone quiet. */
+    bool                loop_trace;
+    uint64_t            lt_next_us;        /* next loop line due (wall) */
+    uint64_t            lt_last_cb_us;     /* last loop callback (wall) */
+    uint64_t            lt_last_app_us;    /* last app-side line (wall) */
+    uint64_t            lt_after_send, lt_after_recv, lt_wake;
+    uint64_t            lt_wake_req, lt_wake_suppressed;
+    const char *volatile lt_phase;      /* where the network thread is now */
+    volatile uint64_t   lt_phase_us;     /* when it entered that phase */
     uint64_t            st_after_send;      /* after_send loop callbacks */
     uint64_t            st_after_send_nz;   /* after_send phases that sent >0 pkts */
     uint64_t            st_after_recv;      /* after_receive loop callbacks */
@@ -878,6 +890,66 @@ static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
     return 0;
 }
 
+/* Where the network thread is inside one loop callback. Written only by that
+ * thread, read by whichever app thread reports a silent loop. */
+#define LT_PHASE(t, p) do { \
+    if ((t)->loop_trace) { (t)->lt_phase = (p); \
+                           (t)->lt_phase_us = picoquic_current_time(); } \
+} while (0)
+
+/* MOQ_PQ_LOOP_TRACE: one line per second from the network thread. Prints the
+ * callbacks seen since the last line, the app-side wake accounting, and what
+ * the loop is about to wait for -- so a loop that stops being driven is told
+ * apart from one that is driven and has nothing to send. */
+static void pq_loop_trace(moq_pq_threaded_t *t, picoquic_quic_t *quic,
+                          uint64_t now)
+{
+    if (!t->loop_trace) return;
+    uint64_t wall = picoquic_current_time();
+    t->lt_last_cb_us = wall;
+    if (t->lt_next_us == 0) { t->lt_next_us = wall + 1000000ull; return; }
+    if (wall < t->lt_next_us) return;
+    t->lt_next_us = wall + 1000000ull;
+
+    pthread_mutex_lock(&t->mutex);
+    int pending = t->wake_pending ? 1 : 0;
+    unsigned long long req = (unsigned long long)t->lt_wake_req;
+    unsigned long long supp = (unsigned long long)t->lt_wake_suppressed;
+    t->lt_wake_req = 0; t->lt_wake_suppressed = 0;
+    pthread_mutex_unlock(&t->mutex);
+
+    long long next_wake = -1;
+    int state = -1;
+    int backlog_empty = -1;
+    if (t->active_cnx) {
+        state = (int)picoquic_get_cnx_state(t->active_cnx);
+        backlog_empty = moq_pq_cnx_stream_backlog_empty(t->active_cnx) ? 1 : 0;
+    }
+    if (quic) {
+        uint64_t nw = picoquic_get_next_wake_time(quic, now);
+        next_wake = (nw == UINT64_MAX) ? -1 : (long long)(nw - now);
+    }
+    long long sess_dl = -1;
+    if (t->conn) {
+        moq_session_t *sess = moq_pq_conn_session(t->conn);
+        if (sess) {
+            uint64_t dl = moq_session_next_deadline_us(sess);
+            sess_dl = (dl == UINT64_MAX) ? -1 : (long long)(dl - now);
+        }
+    }
+
+    fprintf(stderr,
+            "[moq-loop] after_send=%llu after_recv=%llu wake_cb=%llu "
+            "wake_req=%llu wake_supp=%llu wake_pending=%d state=%d "
+            "backlog_empty=%d next_wake_us=%lld sess_deadline_us=%lld\n",
+            (unsigned long long)t->lt_after_send,
+            (unsigned long long)t->lt_after_recv,
+            (unsigned long long)t->lt_wake,
+            req, supp, pending, state, backlog_empty, next_wake, sess_dl);
+    fflush(stderr);
+    t->lt_after_send = t->lt_after_recv = t->lt_wake = 0;
+}
+
 static int loop_callback(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
     void *callback_ctx, void *callback_arg)
@@ -925,12 +997,26 @@ static int loop_callback(picoquic_quic_t *quic,
      * cycle by the public wake contract, so the pre-session early
      * returns below must mark activity for it -- otherwise a parked
      * wait() sleeps out the handshake deadline instead of waking. */
-    bool was_wake_up = (cb_mode == picoquic_packet_loop_wake_up);
-    if (was_wake_up) {
-        pthread_mutex_lock(&t->mutex);
-        t->wake_pending = false;
-        pthread_mutex_unlock(&t->mutex);
+    LT_PHASE(t, "enter");
+    if (t->loop_trace) {
+        if (cb_mode == picoquic_packet_loop_after_send) t->lt_after_send++;
+        else if (cb_mode == picoquic_packet_loop_after_receive) t->lt_after_recv++;
+        else t->lt_wake++;
     }
+
+    bool was_wake_up = (cb_mode == picoquic_packet_loop_wake_up);
+    /* ANY serviced callback consumes the pending wake, not just wake_up:
+     * picoquic may deliver a requested wake inside an after_send /
+     * after_receive cycle without reporting wake_up at all. Clearing the flag
+     * only for wake_up latches it forever the first time that happens -- the
+     * loop then parks (its next wake is the keepalive, 15 s away), every later
+     * moq_pq_threaded_wake() short-circuits on wake_pending, and the
+     * connection goes silent with the app still writing. The flag is cleared
+     * BEFORE this cycle services the connection, so a wake requested during
+     * the service pass arms a fresh one instead of being swallowed. */
+    pthread_mutex_lock(&t->mutex);
+    t->wake_pending = false;
+    pthread_mutex_unlock(&t->mutex);
 
     pthread_mutex_lock(&t->mutex);
     bool close_requested = t->stopped || t->pump_exit;
@@ -1114,6 +1200,7 @@ static int loop_callback(picoquic_quic_t *quic,
         moq_pq_conn_network_changed(t->conn);
 
     /* service → on_lane_pump → service */
+    LT_PHASE(t, "service1");
     if (moq_pq_service(t->conn, now) < 0) {
         pthread_mutex_lock(&t->mutex);
         t->fatal = true;
@@ -1125,6 +1212,7 @@ static int loop_callback(picoquic_quic_t *quic,
     }
 
     if (t->on_lane_pump) {
+        LT_PHASE(t, "lane_pump");
         t->in_lane_pump = true;
         int prc = t->on_lane_pump(t, &t->lane, now, t->on_lane_pump_ctx);
         t->in_lane_pump = false;
@@ -1137,6 +1225,7 @@ static int loop_callback(picoquic_quic_t *quic,
         }
     }
 
+    LT_PHASE(t, "service2");
     if (moq_pq_service(t->conn, now) < 0) {
         pthread_mutex_lock(&t->mutex);
         t->fatal = true;
@@ -1179,6 +1268,8 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
     }
 
+    LT_PHASE(t, "idle(back to picoquic)");
+    pq_loop_trace(t, quic, now);
     mark_activity(t);
     return 0;
 }
@@ -1285,6 +1376,8 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     {   /* Characterization telemetry: opt-in, off unless env set to non-"0". */
         const char *se = getenv("MOQ_PQ_THREADED_STATS");
         t->stats_enabled = se && *se && strcmp(se, "0") != 0;
+        const char *le = getenv("MOQ_PQ_LOOP_TRACE");
+        t->loop_trace = le && *le && strcmp(le, "0") != 0;
     }
 
     /* Copy session tuning. */
@@ -1978,8 +2071,39 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
         pthread_mutex_unlock(&t->mutex);
         return MOQ_ERR_CLOSED;
     }
+    t->lt_wake_req++;
     if (t->wake_pending) {
+        t->lt_wake_suppressed++;
+        bool trace = t->loop_trace;
+        uint64_t last_cb = t->lt_last_cb_us;
+        uint64_t last_app = t->lt_last_app_us;
+        unsigned long long supp = (unsigned long long)t->lt_wake_suppressed;
         pthread_mutex_unlock(&t->mutex);
+        /* The loop has not run since before this wake was requested: report
+         * it from here, because the loop's own line cannot be printed by a
+         * loop that is no longer being called. */
+        if (trace && last_cb) {
+            uint64_t wall = picoquic_current_time();
+            if (wall - last_cb > 2000000ull && wall - last_app > 1000000ull) {
+                pthread_mutex_lock(&t->mutex);
+                t->lt_last_app_us = wall;
+                pthread_mutex_unlock(&t->mutex);
+                const char *ph = t->lt_phase ? t->lt_phase : "?";
+                uint64_t ph_us = t->lt_phase_us;
+                picoquic_network_thread_ctx_t *tc = t->thread_ctx;
+                fprintf(stderr,
+                        "[moq-loop] app wake suppressed: loop silent %.3f s, "
+                        "wake_pending=1, suppressed=%llu, phase=%s for %.3f s, "
+                        "thread_ready=%d should_close=%d is_closed=%d rc=%d\n",
+                        (double)(wall - last_cb) / 1e6, supp, ph,
+                        ph_us ? (double)(wall - ph_us) / 1e6 : -1.0,
+                        tc ? tc->thread_is_ready : -1,
+                        tc ? tc->thread_should_close : -1,
+                        tc ? tc->thread_is_closed : -1,
+                        tc ? tc->return_code : -1);
+                fflush(stderr);
+            }
+        }
         return MOQ_OK;
     }
     t->wake_pending = true;
