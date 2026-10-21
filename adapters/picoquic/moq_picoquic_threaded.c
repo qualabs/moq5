@@ -1108,6 +1108,8 @@ static int loop_callback(picoquic_quic_t *quic,
                     uint64_t ad = t->app_deadline_us(t->app_deadline_ctx);
                     if (ad < dl) dl = ad;
                 }
+                uint64_t aw = moq_pq_conn_next_wake_us(c->conn);
+                if (aw < dl) dl = aw;
                 picoquic_set_app_wake_time(c->cnx,
                                             dl == UINT64_MAX ? 0 : dl);
             }
@@ -1195,7 +1197,7 @@ static int loop_callback(picoquic_quic_t *quic,
         return local_close_step(t, quic);
     }
 
-    /* Set app wake time for session deadlines. */
+    /* Set app wake time for session deadlines and adapter work. */
     if (t->active_cnx) {
         moq_session_t *sess = moq_pq_conn_session(t->conn);
         if (sess) {
@@ -1204,6 +1206,8 @@ static int loop_callback(picoquic_quic_t *quic,
                 uint64_t ad = t->app_deadline_us(t->app_deadline_ctx);
                 if (ad < dl) dl = ad;
             }
+            uint64_t aw = moq_pq_conn_next_wake_us(t->conn);
+            if (aw < dl) dl = aw;
             picoquic_set_app_wake_time(t->active_cnx,
                                         dl == UINT64_MAX ? 0 : dl);
         }

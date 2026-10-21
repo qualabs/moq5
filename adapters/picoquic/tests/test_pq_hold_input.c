@@ -180,6 +180,20 @@ int picoquic_open_flow_control(picoquic_cnx_t *c, uint64_t sid, uint64_t sz)
     { (void)c; int s = fc_slot(sid); g_fc[s].open_calls++; g_fc[s].open_total += sz; return 0; }
 int picoquic_is_client(picoquic_cnx_t *c) { (void)c; return 1; }
 picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *c) { (void)c; return g_cnx_state; }
+/* Client migration: no path events are raised here, so the adapter only
+ * enables path callbacks; the rest is linked but never reached. */
+void picoquic_enable_path_callbacks(picoquic_cnx_t *c, int on) { (void)c; (void)on; }
+void picoquic_get_peer_addr(picoquic_cnx_t *c, struct sockaddr **a) { (void)c; *a = NULL; }
+void picoquic_get_local_addr(picoquic_cnx_t *c, struct sockaddr **a) { (void)c; *a = NULL; }
+int picoquic_addr_length(const struct sockaddr *a) { (void)a; return 0; }
+int picoquic_compare_addr(const struct sockaddr *x, const struct sockaddr *y)
+    { (void)x; (void)y; return -1; }
+int picoquic_probe_new_path(picoquic_cnx_t *c, const struct sockaddr *peer,
+    const struct sockaddr *local, uint64_t now)
+    { (void)c; (void)peer; (void)local; (void)now; return -1; }
+void picoquic_log_app_message(picoquic_cnx_t *c, const char *fmt, ...) { (void)c; (void)fmt; }
+int picoquic_get_path_quality(picoquic_cnx_t *c, uint64_t id, picoquic_path_quality_t *q)
+    { (void)c; (void)id; (void)q; return -1; }
 
 /* -- Counting allocator with failure injection ------------------------- */
 

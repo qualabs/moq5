@@ -285,8 +285,24 @@ uint64_t moq_pq_conn_close_code(const moq_pq_conn_t *conn);
  *
  * Datagrams that hit WOULD_BLOCK are silently dropped (lossy).
  * Returns 0 on success, negative on fatal error.
+ *
+ * Client connection migration (RFC 9000 Section 9): once picoquic suspends
+ * the path of a client connection (a send failed as unreachable), service
+ * passes probe the source address the kernel now routes to the peer from,
+ * and picoquic moves the connection there when the path validates. Nothing
+ * is probed if the server sent disable_active_migration. The adapter enables
+ * picoquic path callbacks on the client connections it attaches to.
  */
 int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us);
+
+/*
+ * Earliest time (picoquic clock, microseconds) at which moq_pq_service has
+ * work that neither a packet nor a session deadline triggers: the route
+ * re-check of a suspended client path. UINT64_MAX when there is none.
+ * An application that owns the loop folds it, with
+ * moq_session_next_deadline_us(), into picoquic_set_app_wake_time().
+ */
+uint64_t moq_pq_conn_next_wake_us(const moq_pq_conn_t *conn);
 
 /*
  * Picoquic stream data callback. Install this as the connection's
