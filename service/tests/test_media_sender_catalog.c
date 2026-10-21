@@ -803,6 +803,80 @@ int main(void)
         MOQ_TEST_PASS("sender_catalog.sap_timeline_pair");
     }
 
+    /* -- init carriage: moq_media_track_cfg_t.init_mode ---------------- *
+     * LOC-01 2.3.2.1 lets a RAW track carry its parameter sets in band (the
+     * Video Config extension on group starts) instead of, or as well as, in
+     * the catalog. The in-band modes are RAW-only and need init_data; an
+     * INBAND-only track contributes nothing to the catalog, BOTH still does
+     * (MSF-01 5.1.7 makes initDataList OPTIONAL). */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_ready(s);
+
+        static const uint8_t init[] = { 0x01, 0x42, 0xe0, 0x1e };
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = (moq_bytes_t){ (const uint8_t *)"v", 1 };
+        tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+        tc.bitrate = 1500000;
+        tc.is_live = true;
+
+        /* The default keeps the pre-init_mode behaviour. */
+        MOQ_TEST_CHECK_EQ_INT((int)tc.init_mode, (int)MOQ_MEDIA_INIT_CATALOG);
+
+        /* In band without init data: nothing to put in the extension. */
+        moq_media_track_t *t = NULL;
+        tc.init_mode = MOQ_MEDIA_INIT_INBAND;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_ERR_INVAL);
+
+        /* In band on CMAF: its init is a moov, and CMSF-01 3.1 puts it in
+         * the catalog. */
+        tc.init_data = (moq_bytes_t){ init, sizeof(init) };
+        tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_ERR_INVAL);
+
+        /* An unknown mode is refused rather than silently treated as 0. */
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.init_mode = (moq_media_init_mode_t)99;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_ERR_INVAL);
+
+        /* INBAND-only: accepted, and its init stays out of the catalog. */
+        tc.init_mode = MOQ_MEDIA_INIT_INBAND;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+
+        /* BOTH: the catalog still carries it (here, legacy LOC inline). */
+        moq_media_track_cfg_t tc2 = tc;
+        tc2.name = (moq_bytes_t){ (const uint8_t *)"w", 1 };
+        tc2.init_mode = MOQ_MEDIA_INIT_BOTH;
+        moq_media_track_t *t2 = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc2, &t2),
+                              (int)MOQ_OK);
+
+        moq_rcbuf_t *j = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_build_catalog(s, &j),
+                              (int)MOQ_OK);
+        if (j) {
+            char tmp[2048];
+            size_t n = moq_rcbuf_len(j);
+            MOQ_TEST_CHECK(n < sizeof(tmp));
+            memcpy(tmp, moq_rcbuf_data(j), n); tmp[n] = '\0';
+            /* Exactly one init payload: "w"'s. The base64 of `init`. */
+            const char *first = strstr(tmp, "AULgHg==");
+            MOQ_TEST_CHECK(first != NULL);
+            if (first) MOQ_TEST_CHECK(strstr(first + 1, "AULgHg==") == NULL);
+            moq_rcbuf_decref(j);
+        }
+
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.init_mode");
+    }
+
     /* -- 5. a generated eventtimeline track is not user-removable ------ */
     {
         moq_media_sender_t *s = moq_media_sender_test_new();

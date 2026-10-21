@@ -201,6 +201,7 @@ struct moq_media_track {
     bool                  has_render_group;
     int                   render_group;
     moq_group_order_t     group_order;         /* MOQT 7.1; DEFAULT = none */
+    moq_media_init_mode_t init_mode;           /* LOC init carriage (RAW only) */
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -1221,7 +1222,9 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
         moq_media_track_t *t = s->tracks[i];
         if (!track_in_catalog(t, only_registered)) continue;
         track_fill_msf(t, &mt[k]);
-        if (t->init_data.len > 0) {
+        /* MSF-01 5.1.7: initDataList is OPTIONAL, so an INBAND-only track
+         * contributes no catalog init at all. BOTH still does. */
+        if (t->init_data.len > 0 && t->init_mode != MOQ_MEDIA_INIT_INBAND) {
             if (sender_init_by_reference(s, t)) {
                 /* CMSF §3.1, and MSF-01 5.1.7/5.2.13 for every track of the
                  * draft-22 companion: the init data lives in initDataList[];
@@ -1426,6 +1429,14 @@ static bool sender_build_props(moq_media_sender_t *s,
     if (t->media_type == MOQ_MEDIA_TYPE_VIDEO) {
         h.has_video_frame_marking = true;
         h.video_frame_marking.independent = e->keyframe;
+        /* LOC-01 2.3.2.1 Video Config (ID 13). Group starts only: a delta
+         * is never the first object decoded. Bytes borrowed from the track. */
+        if (e->keyframe && t->init_data.len > 0 &&
+            (t->init_mode == MOQ_MEDIA_INIT_INBAND ||
+             t->init_mode == MOQ_MEDIA_INIT_BOTH)) {
+            h.has_video_config = true;
+            h.video_config = t->init_data;
+        }
     }
     /* Fail closed on an unobserved or unsupported draft: an object may not
      * be encoded before the session's version has been latched, and there
@@ -2398,8 +2409,10 @@ static bool sender_stage_generation(moq_media_sender_t *s)
              * mpeg2ts track, and every init-bearing track of the draft-22
              * companion (MSF-01 has no per-track initData) -- falls back to
              * a full independent generation. Legacy LOC inline init, and
-             * init-less tracks, stay on the delta path. */
-            if (sender_init_by_reference(s, t))
+             * init-less tracks, stay on the delta path. An INBAND-only
+             * track contributes no catalog entry, so it needs no fallback. */
+            if (sender_init_by_reference(s, t) &&
+                t->init_mode != MOQ_MEDIA_INIT_INBAND)
                 init_ref_add = true;
         } else if (!in_cat && t->in_published) {
             rems[nr++] = t;
@@ -5090,6 +5103,8 @@ static void sender_track_cfg_read(const moq_media_track_cfg_t *in,
     }
     if (TCFG_HAS(group_order))
         out->group_order = in->group_order;
+    if (TCFG_HAS(init_mode))
+        out->init_mode = in->init_mode;
 #undef TCFG_HAS
     out->struct_size = (uint32_t)sizeof(*out);
 }
@@ -5197,6 +5212,21 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
      * a transition in between cannot slip a track in. */
     if (sender_terminal(s)) return MOQ_ERR_CLOSED;
 
+    /* Init carriage. sender_track_cfg_read already defaulted an older
+     * caller's absent field to CATALOG. The in-band modes need init_data and
+     * RAW/LOC packaging. */
+    switch (cfg->init_mode) {
+    case MOQ_MEDIA_INIT_CATALOG:
+        break;
+    case MOQ_MEDIA_INIT_INBAND:
+    case MOQ_MEDIA_INIT_BOTH:
+        if (cfg->packaging != MOQ_MEDIA_PACKAGING_RAW) return MOQ_ERR_INVAL;
+        if (cfg->init_data.len == 0) return MOQ_ERR_INVAL;
+        break;
+    default:
+        return MOQ_ERR_INVAL;
+    }
+
     /* add_track is legal both before and after READY : a post-ready add
      * registers the track and triggers an independent catalog republish. Once
      * completion has been requested (§11.3) the sender is terminal. */
@@ -5294,6 +5324,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->render_group = cfg->render_group;
     t->has_label = cfg->has_label;
     t->group_order = cfg->group_order;
+    t->init_mode = cfg->init_mode;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;

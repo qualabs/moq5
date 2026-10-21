@@ -308,6 +308,19 @@ MOQ_API void moq_media_sender_cfg_init_live_sized(moq_media_sender_cfg_t *cfg,
 MOQ_API void moq_media_sender_cfg_init_lossless_sized(
     moq_media_sender_cfg_t *cfg, size_t cfg_size);
 
+/* Where a track's init data is delivered. LOC-01 2.3.2 permits both
+ * out-of-band and in-band and mandates neither, so the publisher chooses.
+ * RAW/LOC only; ignored for CMAF, whose init always goes in the catalog
+ * (CMSF-01 3.1).
+ *
+ * Writing the parameter sets into the payload itself (the other form LOC-01
+ * permits) is the caller's framing choice and is not covered here. */
+typedef enum moq_media_init_mode {
+    MOQ_MEDIA_INIT_CATALOG = 0,   /* catalog initDataList + initRef (default) */
+    MOQ_MEDIA_INIT_INBAND  = 1,   /* LOC Video Config extension, group starts */
+    MOQ_MEDIA_INIT_BOTH    = 2,   /* both of the above */
+} moq_media_init_mode_t;
+
 /* -- Track configuration (§7.1) --------------------------------------- *
  * Carries enough to derive the track's MSF catalog entry and to package
  * its media. The service builds and publishes the catalog; apps
@@ -341,7 +354,8 @@ typedef struct moq_media_track_cfg {
                                           it during add_track, so the caller's
                                           buffer need not outlive the call.
                                           Empty when the codec carries its
-                                          parameter sets in-band. */
+                                          parameter sets in band (LOC/RAW only:
+                                          CMAF requires it, CMSF-01 3.1). */
     moq_bytes_t role;                  /* empty = derived from media_type */
     moq_bytes_t lang;
     bool        is_live;               /* catalog isLive (presets: true) */
@@ -565,6 +579,18 @@ typedef struct moq_media_track_cfg {
     _Alignas(uint64_t)
 #endif
     moq_group_order_t group_order;
+
+    /* Where init_data is delivered. RAW/LOC only. INBAND/BOTH need a
+     * non-empty init_data; add_track returns MOQ_ERR_INVAL otherwise.
+     * Default CATALOG keeps today's catalog and wire byte-identical.
+     * Aligned past group_order on every target, so a caller's struct_size
+     * that ends there never covers it. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    moq_media_init_mode_t init_mode;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
