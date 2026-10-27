@@ -47,6 +47,7 @@ after rebasing; no new test result is asserted by this inventory.
 | 0008 | Range/direction/terminal classification for reset and STOP preserves the no-mutation `PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED=1` contract. |
 | 0009 | Stateless-reset ingress and sending policy preserve authentication, routing and opt-out behavior. |
 | 0010 | STOP refuses a direct-receive stream whose receive half has completed, without changing its context. |
+| 0011 | A send batch that ends in the fast path with the congestion window full keeps the loss recovery timers armed, so a lost flight is probed within a PTO. |
 
 No new provider API is introduced by this rebase. External provider headers and
 binaries must still implement the existing declared semantic contracts together.
