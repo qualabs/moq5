@@ -51,6 +51,37 @@ if((MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED) AND
     # _MOQ_SERVICE_FACADE_DEFS; not consumer configuration.
     list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK=1)
 endif()
+if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
+    # Map the selected congestion control onto the picoquic symbol the endpoint
+    # installs on its QUIC context. Validated HERE rather than left to the
+    # compiler: a typo must stop the configure with the accepted values in hand,
+    # not surface later as an undefined symbol at link. Carried in
+    # _MOQ_SERVICE_FACADE_DEFS so the white-box endpoint tests, which rebuild
+    # src/endpoint.c from that same list, compile against the same choice.
+    set(_MOQ_SERVICE_CC_SYMBOLS
+        bbr     picoquic_bbr_algorithm
+        bbr1    picoquic_bbr1_algorithm
+        newreno picoquic_newreno_algorithm
+        cubic   picoquic_cubic_algorithm
+        dcubic  picoquic_dcubic_algorithm
+        prague  picoquic_prague_algorithm
+        fastcc  picoquic_fastcc_algorithm
+        c4      c4_algorithm)
+    list(FIND _MOQ_SERVICE_CC_SYMBOLS "${MOQ_SERVICE_CONGESTION_CONTROL}" _moq_cc_at)
+    # An even index is a name; an odd one matched a symbol spelling, which is
+    # not a value this option accepts.
+    math(EXPR _moq_cc_odd "${_moq_cc_at} % 2")
+    if(_moq_cc_at LESS 0 OR _moq_cc_odd)
+        message(FATAL_ERROR
+            "MOQ_SERVICE_CONGESTION_CONTROL='${MOQ_SERVICE_CONGESTION_CONTROL}' is not a \
+congestion control this build offers. Use one of: bbr bbr1 newreno cubic dcubic prague fastcc c4")
+    endif()
+    math(EXPR _moq_cc_at "${_moq_cc_at} + 1")
+    list(GET _MOQ_SERVICE_CC_SYMBOLS ${_moq_cc_at} _moq_cc_symbol)
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS
+         MOQ_SERVICE_CC_ALGORITHM=${_moq_cc_symbol})
+    message(STATUS "moq-service congestion control: ${MOQ_SERVICE_CONGESTION_CONTROL} (${_moq_cc_symbol})")
+endif()
 if(MOQ_BUILD_ADAPTER_MVFST)
     # RAW_QUIC over Meta's mvfst (exact-version only; see src/endpoint.c). The
     # managed C facade lives in moq::adapter-mvfst -- there is no separate

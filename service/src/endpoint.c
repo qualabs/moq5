@@ -68,6 +68,23 @@
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
 #include <picoquic.h>
+/* Every congestion control MOQ_SERVICE_CC_ALGORITHM can name (the CMake option
+ * MOQ_SERVICE_CONGESTION_CONTROL picks one); all are compiled into picoquic's
+ * core, and these are its public headers. Included together rather than per
+ * choice so the selection stays a single symbol in one place. */
+#include <picoquic_bbr.h>
+#include <picoquic_bbr1.h>
+#include <picoquic_newreno.h>
+#include <picoquic_cubic.h>
+#include <picoquic_prague.h>
+#include <picoquic_fastcc.h>
+#include <c4.h>
+/* The build normally supplies this (see service/CMakeLists.txt). The fallback
+ * keeps a hand-rolled compile of this file on the same default the option has,
+ * so BBR is never silently traded back for picoquic's NewReno. */
+#ifndef MOQ_SERVICE_CC_ALGORITHM
+#define MOQ_SERVICE_CC_ALGORITHM picoquic_bbr_algorithm
+#endif
 #endif
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
     PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
@@ -1063,6 +1080,23 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
     if (ep->handshake_timeout_us > 0)
         picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
+    /* Congestion control for every connection this endpoint makes, chosen at
+     * build time by MOQ_SERVICE_CONGESTION_CONTROL (default BBR). picoquic's
+     * own default is NewReno (PICOQUIC_DEFAULT_CONGESTION_ALGORITHM), whose
+     * loss-triggered halving collapses the send rate on the bursty, deadline-
+     * bound traffic a media sender produces: a GOP burst that overshoots the
+     * path costs a cwnd halving and the next groups miss their deadline. BBR
+     * paces to the measured bottleneck bandwidth and RTT instead, so a burst
+     * is spread rather than punished, which is what this tier's live publisher
+     * wants. Set on the context default BEFORE any connection is created, so
+     * the client cnx (raw QUIC and WebTransport alike, both of which route
+     * their configure hook here) starts on it rather than switching later.
+     *
+     * The algorithm is a picoquic-side global the library initialises before
+     * main(); a NULL here would run the connection with NO congestion control
+     * at all, so an unresolved one leaves picoquic's default standing instead. */
+    if (MOQ_SERVICE_CC_ALGORITHM != NULL)
+        picoquic_set_default_congestion_algorithm(quic, MOQ_SERVICE_CC_ALGORITHM);
     if (ep->insecure) return 0;
     /* A delegate selects the callback setter and never falls back to the
      * path verifier: falling back would silently verify against a policy the
