@@ -1,0 +1,186 @@
+Wake a connection right after a send batch, so loss recovery timers stay armed.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0010.
+
+picoquic_prepare_packet_ex fills a send batch (GSO) packet by packet, and from
+the second packet on takes the fast path, which computes no loss recovery or
+ACK timers. When the last attempt sends nothing because the congestion window
+is full, the connection keeps the fast path's wake time, often the keep-alive
+or idle deadline. If the whole flight is then lost, no ACK wakes it and the
+sender stays silent until that deadline (4 to 15 seconds observed under 5%
+loss), where RFC 9002 Section 6.2 expects a probe within one PTO. A batch that
+sent a packet now wakes the connection at once, so the next pass runs the full
+checks.
+Tests (picoquic_ct): batch_flight_loss, which fails without the sender.c
+change.
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index 7bccfd8b..23c9ced7 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -1441,6 +1441,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(batch_flight_loss)
++        {
++            int ret = batch_flight_loss_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(integrity_limit)
+         {
+             int ret = integrity_limit_test();
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+index b3c065da..8ef6109a 100644
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -3783,8 +3783,11 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
+                 }
+             }
+ 
+-            /* Update the wake up time for the connection */
+-            if (coalesced_packet_size > 0 || cnx->cnx_state == picoquic_state_disconnected) {
++            /* Update the wake up time for the connection. Once the batch holds a
++             * packet, wake now even if this last attempt sent nothing: it went
++             * through the fast path, which does not compute the timers. */
++            if (coalesced_packet_size > 0 || *send_length > 0 ||
++                cnx->cnx_state == picoquic_state_disconnected) {
+                 next_wake_time = current_time;
+                 SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+             }
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 9c9cb9e4..9d60a77c 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -325,6 +325,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "multiple_versions", tls_api_multiple_versions_test },
+     { "keep_alive", keep_alive_test },
+     { "keep_alive_idle", keep_alive_idle_test },
++    { "batch_flight_loss", batch_flight_loss_test },
+     { "integrity_limit", integrity_limit_test },
+     { "excess_repeat", excess_repeat_test },
+     { "netperf_basic", netperf_basic_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index c20c01d5..b7d1ace4 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -140,6 +140,7 @@ int tls_api_server_losses_test(void);
+ int skip_frame_test(void);
+ int keep_alive_test(void);
+ int keep_alive_idle_test(void);
++int batch_flight_loss_test(void);
+ int logger_test(void);
+ int binlog_test(void);
+ int binlog_compare_mismatch_test(void);
+diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
+index 2ff052e1..155b7bef 100644
+--- a/picoquictest/tls_api_test.c
++++ b/picoquictest/tls_api_test.c
+@@ -4424,6 +4424,104 @@ int keep_alive_idle_test(void)
+     return ret;
+ }
+ 
++/* A client that fills its congestion window in batches, as the packet loop
++ * does with GSO, and loses every packet must send again within one probe
++ * timeout of its last packet (RFC 9002, section 6.2), not wait for the idle
++ * timer.
++ */
++static test_api_stream_desc_t test_scenario_batch_flight_loss[] = {
++    { 4, 0, 1000000, 257 }
++};
++
++static int batch_flight_loss_send(picoquic_test_tls_api_ctx_t* test_ctx, uint64_t simulated_time, size_t* send_length)
++{
++    uint8_t send_buffer[16 * PICOQUIC_MAX_PACKET_SIZE];
++    struct sockaddr_storage addr_to;
++    struct sockaddr_storage addr_from;
++    int if_index = 0;
++    picoquic_connection_id_t log_cid;
++    picoquic_cnx_t* last_cnx = NULL;
++    size_t send_msg_size = 0;
++
++    return picoquic_prepare_next_packet_ex(test_ctx->qclient, simulated_time, send_buffer, sizeof(send_buffer),
++        send_length, &addr_to, &addr_from, &if_index, &log_cid, &last_cnx, &send_msg_size);
++}
++
++int batch_flight_loss_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    uint64_t last_sent_time = 0;
++    uint64_t repeat_time = 0;
++    uint64_t retransmit_timer = 0;
++    size_t send_length = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++
++    if (ret == 0 && test_ctx == NULL) {
++        return PICOQUIC_ERROR_MEMORY;
++    }
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++
++    if (ret == 0) {
++        ret = tls_api_synch_to_empty_loop(test_ctx, &simulated_time, 2048, 1, 1);
++    }
++
++    if (ret == 0) {
++        ret = test_api_init_send_recv_scenario(test_ctx, test_scenario_batch_flight_loss, sizeof(test_scenario_batch_flight_loss));
++    }
++
++    /* Nothing is delivered. The spacing lets the pacing bucket refill, so a
++     * batch carries several packets. */
++    for (int i = 0; ret == 0 && i < 1024 &&
++        test_ctx->cnx_client->path[0]->bytes_in_transit < test_ctx->cnx_client->path[0]->cwin; i++) {
++        simulated_time += 10000;
++        ret = batch_flight_loss_send(test_ctx, simulated_time, &send_length);
++        if (ret == 0 && send_length > 0) {
++            last_sent_time = simulated_time;
++        }
++    }
++
++    if (ret == 0) {
++        if (test_ctx->cnx_client->path[0]->bytes_in_transit < test_ctx->cnx_client->path[0]->cwin) {
++            DBG_PRINTF("%s", "Congestion window not filled, cannot test\n");
++            ret = -1;
++        }
++        else {
++            retransmit_timer = picoquic_current_retransmit_timer(test_ctx->cnx_client, test_ctx->cnx_client->path[0]);
++        }
++    }
++
++    /* Nothing comes back: the next packet the client sends is a repeat or a probe. */
++    for (int i = 0; ret == 0 && i < 1024 && repeat_time == 0 && TEST_CLIENT_READY &&
++        simulated_time < last_sent_time + PICOQUIC_MICROSEC_SILENCE_MAX; i++) {
++        uint64_t next_time = picoquic_get_next_wake_time(test_ctx->qclient, simulated_time);
++
++        if (next_time > simulated_time) {
++            simulated_time = next_time;
++        }
++        ret = batch_flight_loss_send(test_ctx, simulated_time, &send_length);
++        if (ret == 0 && send_length > 0) {
++            repeat_time = simulated_time;
++        }
++    }
++
++    if (ret == 0 && (repeat_time == 0 || repeat_time > last_sent_time + retransmit_timer)) {
++        DBG_PRINTF("Last packet sent at %" PRIu64 ", next at %" PRIu64 ", retransmit timer %" PRIu64 "\n",
++            last_sent_time, repeat_time, retransmit_timer);
++        ret = -1;
++    }
++
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++
++    return ret;
++}
++
+ int keep_alive_test(void)
+ {
+     int ret = keep_alive_test_impl(1);
