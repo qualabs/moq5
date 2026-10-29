@@ -50,6 +50,17 @@ endif()
 option(MOQ_BUILD_MEDIA_OBJECT      "Build moq-media-object normalizer" ${_MOQ_MEDIA_OBJECT_DEFAULT})
 option(MOQ_BUILD_PLAYBACK          "Build moq-playback pipeline"    OFF)
 option(MOQ_BUILD_SERVICE           "Build moq-service (endpoint + media service tier)" OFF)
+# Congestion control every connection moq_endpoint_connect() makes runs on,
+# over the picoquic backends (raw QUIC and WebTransport alike). BBR is the
+# default: picoquic's own default, NewReno, halves the send rate on the loss a
+# bursty live publisher routinely causes. The other values exist so a build can
+# be compared against it -- see service/src/endpoint.c. Ignored by a build with
+# no picoquic backend, and by the other backends, which carry their own.
+set(MOQ_SERVICE_CONGESTION_CONTROL "bbr" CACHE STRING
+    "Congestion control for the service tier's picoquic connections: \
+bbr, bbr1, newreno, cubic, dcubic, prague, fastcc or c4")
+set_property(CACHE MOQ_SERVICE_CONGESTION_CONTROL PROPERTY STRINGS
+    bbr bbr1 newreno cubic dcubic prague fastcc c4)
 option(MOQ_BUILD_BENCHMARKS        "Build benchmarks"               OFF)
 option(MOQ_BUILD_EXAMPLES          "Build LibMoQ example programs"  ON)
 option(MOQ_BUILD_PQ_THREADED       "Build threaded picoquic helper" OFF)
