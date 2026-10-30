@@ -1,0 +1,40 @@
+Reschedule the connection when a new path or tuple is probed.
+picoquic_probe_new_path_ex queues a PATH_CHALLENGE but leaves the
+connection at its old wake time, so the challenge is only sent once
+something else wakes the connection. A client migrating after its local
+address disappeared then sends nothing until its next keep-alive, since
+stream data waits for the new path to be validated.
+
+Other APIs that create work to send (picoquic_mark_active_stream,
+picoquic_set_app_wake_time) already reinsert the connection by wake time.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2.
+
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index 820087a..36d47b3 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -2553,7 +2553,11 @@ int picoquic_probe_new_path_ex(picoquic_cnx_t* cnx, const struct sockaddr* addr_
+     PICOQUIC_THREAD_CHECK(cnx->quic);
+ 
+     if (!cnx->is_multipath_enabled || to_preferred_address) {
+-        return picoquic_probe_new_tuple(cnx, cnx->path[0], addr_peer, addr_local, if_index, current_time, to_preferred_address);
++        int tuple_ret = picoquic_probe_new_tuple(cnx, cnx->path[0], addr_peer, addr_local, if_index, current_time, to_preferred_address);
++        if (tuple_ret == 0) {
++            picoquic_reinsert_by_wake_time(cnx->quic, cnx, current_time);
++        }
++        return tuple_ret;
+     }
+ 
+     int ret = picoquic_check_new_path_allowed(cnx, to_preferred_address);
+@@ -2586,6 +2590,10 @@ int picoquic_probe_new_path_ex(picoquic_cnx_t* cnx, const struct sockaddr* addr_
+         }
+     }
+ 
++    if (ret == 0) {
++        picoquic_reinsert_by_wake_time(cnx->quic, cnx, current_time);
++    }
++
+     return ret;
+ }
+ 
