@@ -13,8 +13,16 @@
 #include <moq/picoquic.h>
 #include <moq/transport_bridge.h>
 #include "picoquic_endpoint.h"
+#include <picosocks.h>
+#include <picoquic_utils.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Client connection migration (RFC 9000 section 9): how often the route to the
+ * peer is re-read while a check is pending, and how long a probe of one address
+ * may stay unconfirmed before that address may be probed again. */
+#define MOQ_PQ_MIGRATION_CHECK_INTERVAL_US 200000ull
+#define MOQ_PQ_MIGRATION_PROBE_TIMEOUT_US  3000000ull
 
 struct moq_pq_conn {
     moq_session_t              *session;
@@ -51,6 +59,13 @@ struct moq_pq_conn {
      * the attach contract (see <moq/picoquic.h>), and a change of this value
      * found by a service pass fails the connection closed. */
     uint64_t                    tp_max_streams_uni;
+
+    /* Client connection migration (see the block comment above
+     * pq_migration_step). Network thread only. */
+    bool                        path_suspended;
+    uint64_t                    migration_next_check_us;
+    struct sockaddr_storage     migration_probed;   /* ss_family 0 = none */
+    uint64_t                    migration_probed_us;
 #ifdef MOQ_PICOQUIC_TESTING
     uint64_t                    release_terminals;   /* test witness */
 #endif
@@ -989,6 +1004,9 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
     }
 
     picoquic_set_callback(cfg->cnx, moq_pq_callback, c);
+    /* Path events drive client migration (moq_pq_callback). */
+    if (picoquic_is_client(cfg->cnx))
+        picoquic_enable_path_callbacks(cfg->cnx, 1);
 
     *out = c;
     return 0;
@@ -1310,6 +1328,17 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
         break;
     }
 
+    case picoquic_callback_path_suspended:
+        if (picoquic_is_client(cnx)) {
+            c->path_suspended = true;
+            c->migration_next_check_us = 0;
+        }
+        break;
+
+    case picoquic_callback_path_available:
+        c->path_suspended = false;
+        break;
+
     default:
         break;
     }
@@ -1326,6 +1355,109 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
 }
 
 /* -- Service -------------------------------------------------------- */
+
+/* -- Client connection migration -------------------------------------- *
+ *
+ * RFC 9000 section 9 leaves migration to the client, and picoquic leaves
+ * noticing the need for it to the application: it only offers
+ * picoquic_probe_new_path. This adapter owns the client cnx, so it decides.
+ *
+ * Trigger: when the local address of the current path disappears, every send
+ * fails as unreachable and picoquic re-challenges the path, reporting it
+ * through picoquic_callback_path_suspended (once per suspension).
+ *
+ * Action (from moq_pq_service, i.e. on the network thread outside any
+ * picoquic callback): ask the kernel which source address now routes to the
+ * peer. If it differs from the path's, probe it on the same local port, which
+ * is the port of the socket the packet loop sends and receives on. picoquic
+ * validates the new tuple (PATH_CHALLENGE) and makes it the path's first
+ * tuple once the response arrives, raising picoquic_callback_path_available.
+ *
+ * Bounds: the route is re-read at most every
+ * MOQ_PQ_MIGRATION_CHECK_INTERVAL_US while the path stays suspended; an
+ * address already probed is not probed again for
+ * MOQ_PQ_MIGRATION_PROBE_TIMEOUT_US (each probe consumes a peer connection
+ * ID); nothing is probed when the server disabled active migration, since a
+ * PATH_CHALLENGE would then be a protocol violation.
+ *
+ * The probe only queues a PATH_CHALLENGE: patches/picoquic/0012 reinserts the
+ * connection by wake time so it is actually sent, rather than waiting for the
+ * next keep-alive.
+ */
+
+/* Source address the kernel picks toward `peer`. connect() on a UDP socket
+ * only performs the route lookup; nothing is sent. */
+static int pq_route_source_addr(const struct sockaddr *peer,
+                                struct sockaddr_storage *out)
+{
+    SOCKET_TYPE fd = socket(peer->sa_family, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == INVALID_SOCKET)
+        return -1;
+    socklen_t len = (socklen_t)sizeof(*out);
+    int rc = -1;
+    memset(out, 0, sizeof(*out));
+    if (connect(fd, peer, (socklen_t)picoquic_addr_length(peer)) == 0 &&
+        getsockname(fd, (struct sockaddr *)out, &len) == 0)
+        rc = 0;
+    SOCKET_CLOSE(fd);
+    return rc;
+}
+
+static void pq_set_port(struct sockaddr_storage *addr,
+                        const struct sockaddr *from)
+{
+    if (addr->ss_family == AF_INET)
+        ((struct sockaddr_in *)addr)->sin_port =
+            ((const struct sockaddr_in *)from)->sin_port;
+    else if (addr->ss_family == AF_INET6)
+        ((struct sockaddr_in6 *)addr)->sin6_port =
+            ((const struct sockaddr_in6 *)from)->sin6_port;
+}
+
+static void pq_migration_step(moq_pq_conn_t *c, uint64_t now)
+{
+    if (!c->path_suspended || !c->cnx || now < c->migration_next_check_us)
+        return;
+    c->migration_next_check_us = now + MOQ_PQ_MIGRATION_CHECK_INTERVAL_US;
+
+    if (picoquic_get_cnx_state(c->cnx) != picoquic_state_ready)
+        return;
+    picoquic_tp_t const *peer_tp = picoquic_get_transport_parameters(c->cnx, 0);
+    if (peer_tp && peer_tp->migration_disabled) {
+        c->path_suspended = false;
+        return;
+    }
+
+    struct sockaddr *peer = NULL;
+    struct sockaddr *local = NULL;
+    picoquic_get_peer_addr(c->cnx, &peer);
+    picoquic_get_local_addr(c->cnx, &local);
+    if (!peer || !local || local->sa_family != peer->sa_family)
+        return;
+
+    struct sockaddr_storage candidate;
+    if (pq_route_source_addr(peer, &candidate) != 0)
+        return;     /* no route yet; re-read on the next check */
+    pq_set_port(&candidate, local);
+
+    /* Still the current address: nothing to migrate to, and the suspended
+     * path keeps being watched. */
+    if (picoquic_compare_addr((struct sockaddr *)&candidate, local) == 0)
+        return;
+    if (picoquic_compare_addr((struct sockaddr *)&candidate,
+                              (struct sockaddr *)&c->migration_probed) == 0 &&
+        now - c->migration_probed_us < MOQ_PQ_MIGRATION_PROBE_TIMEOUT_US)
+        return;     /* validation of this address still in flight */
+
+    /* Transient failures (no spare peer CID yet) retry on the next check. */
+    if (picoquic_probe_new_path(c->cnx, peer, (struct sockaddr *)&candidate,
+                                now) == 0) {
+        c->migration_probed = candidate;
+        c->migration_probed_us = now;
+        picoquic_log_app_message(c->cnx, "moq: probing new local address "
+                                 "after a network change");
+    }
+}
 
 int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us)
 {
@@ -1359,6 +1491,8 @@ int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us)
              * reported. */
             if (moq_transport_bridge_is_fatal(conn->bridge))
                 rc = MOQ_ERR_INTERNAL;
+            else
+                pq_migration_step(conn, now_us);
         }
     }
 
