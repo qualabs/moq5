@@ -60,6 +60,8 @@
 #include <stdatomic.h>
 #include <time.h>   /* clock_gettime: drain deadline (service tier may use the wall clock) */
 #include <string.h>
+#include <stdio.h>  /* the connect-time congestion-control line (ep_log_congestion_control) */
+#include <stdlib.h> /* getenv: MOQ_CC_LOG */
 
 /* Draft-22 requires exact STOP and ACK-through-FIN stream outcomes from the
  * transport. picoquic provides them from stream-terminal contract version 1;
@@ -2082,6 +2084,49 @@ void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg)
     moq_endpoint_cfg_init_sized(cfg, MOQ_ENDPOINT_CFG_V0_SIZE);
 }
 
+/* The congestion control this endpoint's connection actually runs on, read
+ * off the picoquic algorithm the build installed (MOQ_SERVICE_CC_ALGORITHM,
+ * chosen by MOQ_SERVICE_CONGESTION_CONTROL) rather than re-spelling the
+ * CMake option here: the name is picoquic's own id for the algorithm, so a
+ * build whose option and installed symbol disagreed could not print a
+ * matching one. NULL on a backend that is not picoquic -- mvfst, MsQuic and
+ * wtquic run their stack's own congestion control, which this tier neither
+ * chooses nor can name. */
+const char *moq_endpoint_congestion_control(const moq_endpoint_t *ep)
+{
+    if (!ep || !ep->vt) return NULL;
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+    bool on_picoquic = false;
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED)
+    if (ep->vt == &PQ_VT) on_picoquic = true;
+#endif
+#if defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+    if (ep->vt == &WT_VT) on_picoquic = true;
+#endif
+    if (on_picoquic && MOQ_SERVICE_CC_ALGORITHM != NULL)
+        return MOQ_SERVICE_CC_ALGORITHM->congestion_algorithm_id;
+#endif
+    return NULL;
+}
+
+/* One line per connection, on stderr, naming the congestion control the
+ * connection just made runs on. The choice is made at build time, so two
+ * builds that differ only in it are otherwise indistinguishable from the
+ * outside: a capture can be attributed to a congestion control from the
+ * process output alone, with no build manifest to trust. Printed by the
+ * library rather than by each app so ffmpeg, OBS and the tools all report it
+ * without carrying the code. On stderr because that is where this tier's
+ * other characterization output goes (MOQ_PQ_STATS). Always on; set
+ * MOQ_CC_LOG=0 to turn it off. */
+static void ep_log_congestion_control(const moq_endpoint_t *ep)
+{
+    const char *q = getenv("MOQ_CC_LOG");
+    if (q && strcmp(q, "0") == 0) return;
+    const char *cc = moq_endpoint_congestion_control(ep);
+    fprintf(stderr, "MOQ_CC congestion_control=%s\n",
+            cc ? cc : "transport-default");
+}
+
 moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
                                   moq_endpoint_t **out)
 {
@@ -2272,6 +2317,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
         return crc;
     }
 
+    ep_log_congestion_control(ep);
     *out = ep;
     return MOQ_OK;
 #endif /* any facade available */

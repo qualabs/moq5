@@ -658,6 +658,17 @@ MOQ_API moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
  * CATALOG_READY to configure parsers/encoders. */
 MOQ_API moq_version_t moq_endpoint_negotiated_version(const moq_endpoint_t *ep);
 
+/* The congestion control the endpoint's connection runs on, as picoquic's own
+ * algorithm id ("bbr", "cubic", "newreno", ...), or NULL on a backend whose
+ * stack owns that choice (mvfst, MsQuic, wtquic) and on a NULL endpoint. The
+ * choice is made at build time by MOQ_SERVICE_CONGESTION_CONTROL and is
+ * constant for the endpoint's lifetime, so it is readable as soon as
+ * connect() returns. The string is static; the caller does not free it.
+ * MOQ_ENDPOINT_HAVE_CONGESTION_CONTROL lets an app compile against a libmoq
+ * that predates this call. */
+#define MOQ_ENDPOINT_HAVE_CONGESTION_CONTROL 1
+MOQ_API const char *moq_endpoint_congestion_control(const moq_endpoint_t *ep);
+
 /* -- Interrupt latch (§5.3) ------------------------------------------ *
  * Sticky, not a one-shot wake: while latched, every blocking call on the
  * endpoint AND on attached media objects returns MOQ_ERR_INTERRUPTED
